@@ -9,6 +9,7 @@ import android.provider.MediaStore
 import androidx.exifinterface.media.ExifInterface
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
@@ -51,20 +52,24 @@ object ImageProcessor {
         val dir = if (img.relativePath.startsWith("DCIM") || img.relativePath.startsWith("Pictures"))
             img.relativePath else "Pictures/WebP Gallery"
 
+        val taken = img.date // дата съёмки (или время изменения, если съёмки нет)
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, "$base.$ext")
             put(MediaStore.Images.Media.MIME_TYPE, outMime)
             put(MediaStore.Images.Media.RELATIVE_PATH, dir)
-            if (img.dateTaken > 0) put(MediaStore.Images.Media.DATE_TAKEN, img.dateTaken)
+            put(MediaStore.Images.Media.DATE_TAKEN, taken)
             put(MediaStore.Images.Media.IS_PENDING, 1)
         }
         val collection = MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
         val newUri = cr.insert(collection, values) ?: error("insert failed")
         try {
             cr.openOutputStream(newUri)!!.use { it.write(data) }
+            setFileTime(cr, newUri, img.dateModified * 1000)
             cr.update(newUri, ContentValues().apply {
                 put(MediaStore.Images.Media.IS_PENDING, 0)
             }, null, null)
+            // Сканер мог перезаписать даты при снятии IS_PENDING — возвращаем оригинальные
+            restoreDates(cr, newUri, taken, img.dateModified)
         } catch (e: Throwable) {
             cr.delete(newUri, null, null)
             throw e
@@ -73,11 +78,41 @@ object ImageProcessor {
     }
 
     /** Очистка метаданных прямо в файле (нужен createWriteRequest). Всё считается в памяти до записи. */
-    fun cleanInPlace(cr: ContentResolver, uri: Uri, mime: String) {
-        val bytes = cr.openInputStream(uri)!!.use { it.readBytes() }
-        val clean = stripMetadata(cr, uri, mime, bytes)
-        cr.openOutputStream(uri, "wt")!!.use { it.write(clean) }
+    fun cleanInPlace(cr: ContentResolver, img: GalleryImage) {
+        val bytes = cr.openInputStream(img.uri)!!.use { it.readBytes() }
+        val clean = stripMetadata(cr, img.uri, img.mime, bytes)
+        cr.openOutputStream(img.uri, "wt")!!.use { it.write(clean) }
+        setFileTime(cr, img.uri, img.dateModified * 1000)
+        restoreDates(cr, img.uri, img.date, img.dateModified)
     }
+
+    // ---------- Даты ----------
+
+    fun restoreDates(cr: ContentResolver, uri: Uri, takenMs: Long, modifiedSec: Long) {
+        try {
+            cr.update(uri, ContentValues().apply {
+                put(MediaStore.Images.Media.DATE_TAKEN, takenMs)
+            }, null, null)
+        } catch (e: Throwable) {
+        }
+        try {
+            cr.update(uri, ContentValues().apply {
+                put(MediaStore.MediaColumns.DATE_MODIFIED, modifiedSec)
+            }, null, null)
+        } catch (e: Throwable) {
+        }
+    }
+
+    private fun setFileTime(cr: ContentResolver, uri: Uri, modifiedMs: Long) {
+        try {
+            cr.query(uri, arrayOf(MediaStore.MediaColumns.DATA), null, null, null)?.use { c ->
+                if (c.moveToFirst()) File(c.getString(0)).setLastModified(modifiedMs)
+            }
+        } catch (e: Throwable) {
+        }
+    }
+
+    // ---------- Метаданные ----------
 
     fun stripMetadata(cr: ContentResolver, uri: Uri, mime: String, bytes: ByteArray): ByteArray =
         when (mime) {
