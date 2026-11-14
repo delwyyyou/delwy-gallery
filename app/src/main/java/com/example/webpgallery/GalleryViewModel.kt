@@ -82,6 +82,8 @@ fun buildEntries(list: List<GalleryImage>, grouped: Boolean): List<Entry> {
 
 class GalleryViewModel(app: Application) : AndroidViewModel(app) {
 
+    private enum class Op { TRASH, RESTORE, DELETE }
+
     var images by mutableStateOf<List<GalleryImage>>(emptyList()); private set
     var trash by mutableStateOf<List<GalleryImage>>(emptyList()); private set
     var entries by mutableStateOf<List<Entry>>(emptyList()); private set
@@ -92,7 +94,7 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
     var exifVersion by mutableIntStateOf(0); private set
     var message by mutableStateOf<String?>(null)
 
-    /** Корзина / восстановление / удаление навсегда — после результата просто перезагружаем список */
+    /** Корзина / восстановление / удаление навсегда — после результата вызываем onSystemResult */
     val request = MutableSharedFlow<IntentSender>(extraBufferCapacity = 1)
 
     /** Запрос на запись в файл (очистка EXIF) */
@@ -101,6 +103,11 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
     private var rawImages = emptyList<GalleryImage>()
     private var rawTrash = emptyList<GalleryImage>()
     private var pendingClean: GalleryImage? = null
+
+    // Системные запросы идут пачками, чтобы не упереться в лимит размера PendingIntent
+    private val queue = ArrayDeque<Pair<Op, List<Uri>>>()
+    private var inFlight = false
+
     private val cr: ContentResolver get() = getApplication<Application>().contentResolver
 
     val current: List<GalleryImage> get() = if (showTrash) trash else images
@@ -161,23 +168,51 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun selectedUris(): List<Uri> = current.filter { it.id in selected }.map { it.uri }
 
-    // ---------- Корзина ----------
+    // ---------- Корзина (системные запросы пачками) ----------
 
-    /** true — в корзину, false — восстановить */
-    fun moveSelected(toTrash: Boolean) {
-        val uris = selectedUris()
+    private fun enqueue(op: Op, uris: List<Uri>) {
         if (uris.isEmpty()) return
+        uris.chunked(500).forEach { queue.add(op to it) }
+        if (!inFlight) next()
+    }
+
+    private fun next() {
+        val item = queue.removeFirstOrNull()
+        if (item == null) {
+            inFlight = false
+            return
+        }
+        inFlight = true
+        val (op, batch) = item
         viewModelScope.launch {
-            request.emit(MediaStore.createTrashRequest(cr, uris, toTrash).intentSender)
+            val pi = when (op) {
+                Op.TRASH -> MediaStore.createTrashRequest(cr, batch, true)
+                Op.RESTORE -> MediaStore.createTrashRequest(cr, batch, false)
+                Op.DELETE -> MediaStore.createDeleteRequest(cr, batch)
+            }
+            request.emit(pi.intentSender)
         }
     }
 
-    fun deleteSelectedForever() {
-        val uris = selectedUris()
-        if (uris.isEmpty()) return
-        viewModelScope.launch {
-            request.emit(MediaStore.createDeleteRequest(cr, uris).intentSender)
+    /** Вызывается после ответа пользователя на системный диалог */
+    fun onSystemResult(ok: Boolean) {
+        inFlight = false
+        if (ok) {
+            selected = emptySet()
+            next()
+        } else {
+            queue.clear()
         }
+        load()
+    }
+
+    /** true — в корзину, false — восстановить */
+    fun moveSelected(toTrash: Boolean) {
+        enqueue(if (toTrash) Op.TRASH else Op.RESTORE, selectedUris())
+    }
+
+    fun deleteSelectedForever() {
+        enqueue(Op.DELETE, selectedUris())
     }
 
     // ---------- Очистка EXIF прямо в файле ----------
@@ -213,36 +248,47 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---------- Сжатие ----------
 
-    fun run(opt: Options) {
-        val list = images.filter { it.id in selected && it.canProcess }
+    /** all = true — обработать все JPEG/PNG в галерее, иначе только выбранные */
+    fun run(opt: Options, all: Boolean = false) {
         if (progress != null) return
+        val list = if (all) images.filter { it.canProcess }
+        else images.filter { it.id in selected && it.canProcess }
         if (list.isEmpty()) {
-            message = "Среди выбранных нет JPEG/PNG"
+            message = "Нет JPEG/PNG для обработки"
             return
         }
+        progress = 0 to list.size
         viewModelScope.launch {
             var saved = 0L
             var ok = 0
+            var skipped = 0
             var fail = 0
             val processed = mutableListOf<Uri>()
             list.forEachIndexed { idx, img ->
                 progress = idx to list.size
                 try {
                     val r = withContext(Dispatchers.IO) { ImageProcessor.process(cr, img, opt) }
-                    saved += r.before - r.after
-                    ok++
-                    processed += img.uri
+                    if (r.skipped) {
+                        skipped++
+                    } else {
+                        saved += r.before - r.after
+                        ok++
+                        processed += img.uri
+                    }
                 } catch (e: Throwable) {
                     fail++
                 }
             }
             progress = null
             selected = emptySet()
-            message = "Готово: $ok, ошибок: $fail. Освобождено ${formatSize(saved)}"
-            load()
-            if (opt.trashOriginals && processed.isNotEmpty()) {
-                request.emit(MediaStore.createTrashRequest(cr, processed, true).intentSender)
+            message = buildString {
+                append("Готово: $ok")
+                if (skipped > 0) append(", пропущено: $skipped")
+                if (fail > 0) append(", ошибок: $fail")
+                append(". Освобождено ${formatSize(saved)}")
             }
+            load()
+            if (opt.trashOriginals) enqueue(Op.TRASH, processed)
         }
     }
 
