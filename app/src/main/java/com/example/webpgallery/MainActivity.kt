@@ -22,8 +22,11 @@ import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -33,6 +36,10 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateCentroid
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
@@ -79,17 +86,21 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.util.lerp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -176,22 +187,24 @@ fun GalleryApp(vm: GalleryViewModel = viewModel()) {
 
     val systemLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartIntentSenderForResult()
-    ) { r ->
-        if (r.resultCode == Activity.RESULT_OK) vm.clearSelection()
-        vm.load()
-    }
+    ) { r -> vm.onSystemResult(r.resultCode == Activity.RESULT_OK) }
     val cleanLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartIntentSenderForResult()
     ) { r -> vm.onCleanResult(r.resultCode == Activity.RESULT_OK) }
 
     val snackbar = remember { SnackbarHostState() }
     var showOptions by remember { mutableStateOf(false) }
+    var optimizeAll by remember { mutableStateOf(false) }
     var viewer by remember { mutableStateOf<Int?>(null) }
     var viewerOrigin by remember { mutableStateOf(Offset.Unspecified) }
     var columns by rememberSaveable { mutableIntStateOf(3) }
     val galleryGrid = rememberLazyGridState()
     val trashGrid = rememberLazyGridState()
     val scroll = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
+
+    val fabExpanded by remember { derivedStateOf { galleryGrid.firstVisibleItemIndex == 0 } }
+    val showFab = granted && !vm.showTrash && vm.selected.isEmpty() &&
+        vm.progress == null && vm.images.any { it.canProcess }
 
     LaunchedEffect(Unit) {
         if (!has(perm) || !has(loc)) permLauncher.launch(arrayOf(perm, loc))
@@ -242,7 +255,21 @@ fun GalleryApp(vm: GalleryViewModel = viewModel()) {
             bottomBar = {
                 val actionMode = vm.selected.isNotEmpty() || vm.progress != null
                 AnimatedContent(targetState = actionMode, label = "bottom") { mode ->
-                    if (mode) ActionBar(vm) { showOptions = true } else NavBar(vm)
+                    if (mode) {
+                        ActionBar(vm) { optimizeAll = false; showOptions = true }
+                    } else {
+                        NavBar(vm)
+                    }
+                }
+            },
+            floatingActionButton = {
+                AnimatedVisibility(visible = showFab, enter = scaleIn(), exit = scaleOut()) {
+                    ExtendedFloatingActionButton(
+                        onClick = { optimizeAll = true; showOptions = true },
+                        expanded = fabExpanded,
+                        icon = { Icon(Icons.Filled.Compress, null) },
+                        text = { Text("Оптимизировать все") },
+                    )
                 }
             },
         ) { padding ->
@@ -265,7 +292,7 @@ fun GalleryApp(vm: GalleryViewModel = viewModel()) {
                             columns = GridCells.Fixed(columns),
                             state = if (vm.showTrash) trashGrid else galleryGrid,
                             modifier = Modifier.fillMaxSize().pinchColumns(columns) { columns = it },
-                            contentPadding = PaddingValues(start = 6.dp, end = 6.dp, top = 4.dp, bottom = 16.dp),
+                            contentPadding = PaddingValues(start = 6.dp, end = 6.dp, top = 4.dp, bottom = 88.dp),
                             horizontalArrangement = Arrangement.spacedBy(gap),
                             verticalArrangement = Arrangement.spacedBy(gap),
                         ) {
@@ -319,17 +346,26 @@ fun GalleryApp(vm: GalleryViewModel = viewModel()) {
         var quality by remember { mutableFloatStateOf(80f) }
         var lossless by remember { mutableStateOf(false) }
         var trashOrig by remember { mutableStateOf(true) }
+        val all = vm.images.filter { it.canProcess }
         AlertDialog(
             onDismissRequest = { showOptions = false },
-            title = { Text("Параметры") },
+            title = { Text(if (optimizeAll) "Оптимизировать все" else "Параметры") },
             text = {
                 Column {
+                    if (optimizeAll) {
+                        Text(
+                            "Будет обработано: ${all.size} фото (${formatSize(all.sumOf { it.size })})",
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(bottom = 12.dp),
+                        )
+                    }
                     Text("Качество WebP: ${quality.toInt()}")
                     Slider(value = quality, onValueChange = { quality = it }, valueRange = 50f..100f)
                     SwitchRow("PNG без потерь (lossless)", lossless) { lossless = it }
                     SwitchRow("Оригиналы — в корзину", trashOrig) { trashOrig = it }
                     Text(
-                        "Файлы до 300 КБ не пересжимаются — из них только удаляется EXIF. Дата съёмки сохраняется.",
+                        "Файлы до 300 КБ не пересжимаются — из них только удаляется EXIF. " +
+                            "Уже чистые файлы пропускаются. Дата съёмки сохраняется.",
                         style = MaterialTheme.typography.bodySmall,
                         modifier = Modifier.padding(top = 8.dp),
                     )
@@ -338,7 +374,7 @@ fun GalleryApp(vm: GalleryViewModel = viewModel()) {
             confirmButton = {
                 TextButton(onClick = {
                     showOptions = false
-                    vm.run(Options(quality.toInt(), lossless, trashOrig))
+                    vm.run(Options(quality.toInt(), lossless, trashOrig), all = optimizeAll)
                 }) { Text("Начать") }
             },
             dismissButton = { TextButton(onClick = { showOptions = false }) { Text("Отмена") } },
@@ -489,6 +525,7 @@ fun Viewer(vm: GalleryViewModel, start: Int, origin: Offset, onClose: () -> Unit
     var dragY by remember { mutableFloatStateOf(0f) }
     var showInfo by remember { mutableStateOf(false) }
     var closing by remember { mutableStateOf(false) }
+    var zoomed by remember { mutableStateOf(false) }
     val pager = rememberPagerState(initialPage = start.coerceIn(0, list.lastIndex)) { list.size }
     val cur = list.getOrNull(pager.currentPage)
 
@@ -496,6 +533,8 @@ fun Viewer(vm: GalleryViewModel, start: Int, origin: Offset, onClose: () -> Unit
     LaunchedEffect(Unit) {
         progress.animateTo(1f, spring(Spring.DampingRatioLowBouncy, Spring.StiffnessMediumLow))
     }
+    // Новая страница всегда открывается без зума
+    LaunchedEffect(pager.currentPage) { zoomed = false }
 
     fun close() {
         if (closing) return
@@ -558,12 +597,15 @@ fun Viewer(vm: GalleryViewModel, start: Int, origin: Offset, onClose: () -> Unit
                     shape = RoundedCornerShape(lerp(160f, 0f, p.coerceIn(0f, 1f)))
                 }
         ) {
-            HorizontalPager(pager, Modifier.fillMaxSize(), pageSpacing = 16.dp) { page ->
-                AsyncImage(
+            HorizontalPager(
+                pager,
+                Modifier.fillMaxSize(),
+                pageSpacing = 16.dp,
+                userScrollEnabled = !zoomed,
+            ) { page ->
+                ZoomableImage(
                     model = list[page].uri,
-                    contentDescription = null,
-                    contentScale = ContentScale.Fit,
-                    modifier = Modifier.fillMaxSize(),
+                    onZoomChange = { if (page == pager.currentPage) zoomed = it },
                 )
             }
 
@@ -619,6 +661,96 @@ fun Viewer(vm: GalleryViewModel, start: Int, origin: Offset, onClose: () -> Unit
             ) {
                 if (cur != null) InfoPanel(cur, vm)
             }
+        }
+    }
+}
+
+/**
+ * Зум щипком (до 5×), двойной тап (2.5× и обратно), перемещение пальцем в приближении.
+ * При масштабе 1× одиночные касания не перехватываются — работают листание и свайпы вверх/вниз.
+ */
+@Composable
+fun ZoomableImage(model: Any, onZoomChange: (Boolean) -> Unit) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var scale by remember { mutableFloatStateOf(1f) }
+    var offset by remember { mutableStateOf(Offset.Zero) }
+    var viewSize by remember { mutableStateOf(IntSize.Zero) }
+    val zoomed by remember { derivedStateOf { scale > 1.01f } }
+
+    LaunchedEffect(zoomed) { onZoomChange(zoomed) }
+
+    fun clamp(o: Offset, s: Float): Offset {
+        val mx = (viewSize.width * (s - 1f) / 2f).coerceAtLeast(0f)
+        val my = (viewSize.height * (s - 1f) / 2f).coerceAtLeast(0f)
+        return Offset(o.x.coerceIn(-mx, mx), o.y.coerceIn(-my, my))
+    }
+
+    Box(
+        Modifier
+            .fillMaxSize()
+            .onSizeChanged { viewSize = it }
+            .pointerInput(Unit) {
+                detectTapGestures(onDoubleTap = { tap ->
+                    scope.launch {
+                        val startScale = scale
+                        val startOffset = offset
+                        val target = if (startScale > 1.05f) 1f else 2.5f
+                        val focus = tap - Offset(viewSize.width / 2f, viewSize.height / 2f)
+                        animate(0f, 1f, animationSpec = tween(280)) { t, _ ->
+                            val s = lerp(startScale, target, t).coerceIn(1f, 5f)
+                            val z = s / startScale
+                            scale = s
+                            offset = clamp(focus * (1f - z) + startOffset * z, s)
+                        }
+                    }
+                })
+            }
+            .pointerInput(Unit) {
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false)
+                    do {
+                        val event = awaitPointerEvent()
+                        val canceled = event.changes.any { it.isConsumed }
+                        if (!canceled) {
+                            val pointers = event.changes.count { it.pressed }
+                            if (pointers >= 2 || scale > 1.01f) {
+                                val zoom = event.calculateZoom()
+                                val pan = event.calculatePan()
+                                val c = event.calculateCentroid(useCurrent = false)
+                                val newScale = (scale * zoom).coerceIn(1f, 5f)
+                                val z = newScale / scale
+                                val mid = Offset(viewSize.width / 2f, viewSize.height / 2f)
+                                val focus = if (c.isSpecified) c - mid else Offset.Zero
+                                offset = clamp(focus * (1f - z) + offset * z + pan, newScale)
+                                scale = newScale
+                                event.changes.forEach { if (it.positionChanged()) it.consume() }
+                            }
+                        }
+                    } while (!canceled && event.changes.any { it.pressed })
+                }
+            }
+            .graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+                translationX = offset.x
+                translationY = offset.y
+            }
+    ) {
+        if (viewSize.width > 0) {
+            // Запрашиваем картинку с запасом по размеру, чтобы в зуме она не была мыльной
+            val request = remember(model, viewSize) {
+                ImageRequest.Builder(ctx)
+                    .data(model)
+                    .size(viewSize.width * 3, viewSize.height * 3)
+                    .build()
+            }
+            AsyncImage(
+                model = request,
+                contentDescription = null,
+                contentScale = ContentScale.Fit,
+                modifier = Modifier.fillMaxSize(),
+            )
         }
     }
 }
@@ -789,21 +921,17 @@ fun Tile(
             modifier = Modifier.fillMaxSize(),
         )
 
-        if (!dense) {
-            val highlight = img.isBig && !trashMode
+        // В галерее на плитках больше нет веса и WEBP; в корзине — только срок до автоудаления
+        if (daysLeft >= 0 && !dense) {
             Text(
-                text = when {
-                    daysLeft >= 0 -> "$daysLeft дн."
-                    img.mime == "image/webp" -> "WEBP"
-                    else -> formatSize(img.size)
-                },
+                text = "$daysLeft дн.",
                 style = MaterialTheme.typography.labelSmall,
-                color = if (highlight) cs.onTertiaryContainer else cs.onSurface,
+                color = cs.onSurface,
                 modifier = Modifier
                     .align(Alignment.BottomStart)
                     .padding(6.dp)
                     .clip(CircleShape)
-                    .background(if (highlight) cs.tertiaryContainer else cs.surface.copy(alpha = 0.75f))
+                    .background(cs.surface.copy(alpha = 0.75f))
                     .padding(horizontal = 8.dp, vertical = 2.dp),
             )
         }
