@@ -7,6 +7,7 @@ import android.app.Activity
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.view.TextureView
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -45,6 +46,7 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyGridState
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
@@ -55,6 +57,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Sort
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CheckCircle
@@ -63,11 +66,15 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Compress
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DeleteForever
+import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PhotoLibrary
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.RestoreFromTrash
 import androidx.compose.material.icons.filled.SelectAll
 import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material.icons.outlined.RadioButtonUnchecked
 import androidx.compose.material3.*
@@ -98,17 +105,35 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.util.lerp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
+import androidx.media3.exoplayer.ExoPlayer
+import coil.Coil
+import coil.ImageLoader
 import coil.compose.AsyncImage
+import coil.decode.VideoFrameDecoder
 import coil.request.ImageRequest
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Coil умеет доставать кадры из видео для превью
+        Coil.setImageLoader(
+            ImageLoader.Builder(this)
+                .components { add(VideoFrameDecoder.Factory()) }
+                .build()
+        )
         enableEdgeToEdge()
         setContent { GalleryTheme { GalleryApp() } }
     }
@@ -176,15 +201,24 @@ fun Modifier.pinchColumns(columns: Int, onChange: (Int) -> Unit): Modifier {
 @Composable
 fun GalleryApp(vm: GalleryViewModel = viewModel()) {
     val context = LocalContext.current
-    val perm = if (Build.VERSION.SDK_INT >= 33)
+    val permImages = if (Build.VERSION.SDK_INT >= 33)
         Manifest.permission.READ_MEDIA_IMAGES else Manifest.permission.READ_EXTERNAL_STORAGE
-    val loc = Manifest.permission.ACCESS_MEDIA_LOCATION
+    val permList = remember {
+        buildList {
+            add(permImages)
+            if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.READ_MEDIA_VIDEO)
+            add(Manifest.permission.ACCESS_MEDIA_LOCATION)
+        }.toTypedArray()
+    }
     fun has(p: String) = ContextCompat.checkSelfPermission(context, p) == PackageManager.PERMISSION_GRANTED
 
-    var granted by remember { mutableStateOf(has(perm)) }
+    var granted by remember { mutableStateOf(has(permImages)) }
     val permLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { granted = has(perm) }
+    ) {
+        granted = has(permImages)
+        if (granted) vm.load()
+    }
 
     val systemLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartIntentSenderForResult()
@@ -201,16 +235,22 @@ fun GalleryApp(vm: GalleryViewModel = viewModel()) {
     var columns by rememberSaveable { mutableIntStateOf(3) }
     val galleryGrid = rememberLazyGridState()
     val trashGrid = rememberLazyGridState()
+    val albumGrid = rememberLazyGridState()
+    val albumsListGrid = rememberLazyGridState()
     val scroll = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
 
+    val inAlbumsList = vm.tab == NavTab.ALBUMS && vm.album == null
+    val inAlbum = vm.tab == NavTab.ALBUMS && vm.album != null
+
     val fabExpanded by remember { derivedStateOf { galleryGrid.firstVisibleItemIndex == 0 } }
-    val showFab = granted && !vm.showTrash && vm.selected.isEmpty() &&
+    val showFab = granted && vm.tab == NavTab.GALLERY && vm.selected.isEmpty() &&
         vm.progress == null && vm.images.any { it.canProcess }
 
     LaunchedEffect(Unit) {
-        if (!has(perm) || !has(loc)) permLauncher.launch(arrayOf(perm, loc))
+        if (permList.any { !has(it) }) permLauncher.launch(permList)
     }
     LaunchedEffect(granted) { if (granted) vm.load() }
+    LaunchedEffect(vm.album) { albumGrid.scrollToItem(0) }
     LaunchedEffect(Unit) {
         vm.request.collect { systemLauncher.launch(IntentSenderRequest.Builder(it).build()) }
     }
@@ -220,8 +260,13 @@ fun GalleryApp(vm: GalleryViewModel = viewModel()) {
     LaunchedEffect(vm.message) {
         vm.message?.let { snackbar.showSnackbar(it); vm.message = null }
     }
+
+    // «Назад»: сначала снять выбор, потом выйти из альбома, потом на вкладку «Галерея»
     BackHandler(vm.selected.isNotEmpty()) { vm.clearSelection() }
-    BackHandler(vm.showTrash && vm.selected.isEmpty()) { vm.openTrash(false) }
+    BackHandler(vm.selected.isEmpty() && inAlbum) { vm.closeAlbum() }
+    BackHandler(vm.selected.isEmpty() && !inAlbum && vm.tab != NavTab.GALLERY) {
+        vm.openTab(NavTab.GALLERY)
+    }
 
     Box(Modifier.fillMaxSize()) {
         Scaffold(
@@ -232,21 +277,28 @@ fun GalleryApp(vm: GalleryViewModel = viewModel()) {
                         Text(
                             when {
                                 vm.selected.isNotEmpty() -> "Выбрано: ${vm.selected.size}"
-                                vm.showTrash -> "Корзина"
+                                vm.tab == NavTab.TRASH -> "Корзина"
+                                vm.tab == NavTab.ALBUMS -> vm.album?.let { albumName(it) } ?: "Альбомы"
                                 else -> "Галерея"
                             },
                             fontWeight = FontWeight.ExtraBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
                         )
                     },
                     navigationIcon = {
                         if (vm.selected.isNotEmpty()) {
                             IconButton(onClick = vm::clearSelection) { Icon(Icons.Filled.Close, null) }
+                        } else if (inAlbum) {
+                            IconButton(onClick = vm::closeAlbum) {
+                                Icon(Icons.AutoMirrored.Filled.ArrowBack, null)
+                            }
                         }
                     },
                     actions = {
                         if (vm.selected.isNotEmpty()) {
                             IconButton(onClick = vm::selectAll) { Icon(Icons.Filled.SelectAll, null) }
-                        } else {
+                        } else if (!inAlbumsList) {
                             SortMenu(vm)
                         }
                     },
@@ -277,8 +329,8 @@ fun GalleryApp(vm: GalleryViewModel = viewModel()) {
             Box(Modifier.fillMaxSize().padding(padding)) {
                 if (!granted) {
                     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        Button(onClick = { permLauncher.launch(arrayOf(perm, loc)) }) {
-                            Text("Разрешить доступ к фото")
+                        Button(onClick = { permLauncher.launch(permList) }) {
+                            Text("Разрешить доступ к фото и видео")
                         }
                     }
                 } else {
@@ -288,51 +340,61 @@ fun GalleryApp(vm: GalleryViewModel = viewModel()) {
                         onRefresh = vm::refresh,
                         modifier = Modifier.fillMaxSize(),
                     ) {
-                        val entries = vm.entries
-                        if (entries.isEmpty()) {
-                            EmptyState(vm.showTrash)
+                        if (inAlbumsList) {
+                            AlbumsGrid(vm, albumsListGrid)
                         } else {
-                            val dense = columns >= 5
-                            val gap = if (dense) 2.dp else 4.dp
-                            val selectionMode = vm.selected.isNotEmpty()
-                            LazyVerticalGrid(
-                                columns = GridCells.Fixed(columns),
-                                state = if (vm.showTrash) trashGrid else galleryGrid,
-                                modifier = Modifier.fillMaxSize().pinchColumns(columns) { columns = it },
-                                contentPadding = PaddingValues(start = 6.dp, end = 6.dp, top = 4.dp, bottom = 88.dp),
-                                horizontalArrangement = Arrangement.spacedBy(gap),
-                                verticalArrangement = Arrangement.spacedBy(gap),
-                            ) {
-                                items(
-                                    entries,
-                                    key = { it.key },
-                                    span = { e -> if (e is Header) GridItemSpan(maxLineSpan) else GridItemSpan(1) },
-                                ) { e ->
-                                    when (e) {
-                                        is Header -> DayHeader(
-                                            label = e.label,
-                                            selectionMode = selectionMode,
-                                            allSelected = vm.selected.containsAll(e.ids),
-                                            modifier = Modifier.animateItem(),
-                                            onClick = { vm.toggleGroup(e.ids) },
-                                        )
-                                        is Photo -> Tile(
-                                            img = e.img,
-                                            trashMode = vm.showTrash,
-                                            selected = e.img.id in vm.selected,
-                                            selectionMode = selectionMode,
-                                            dense = dense,
-                                            modifier = Modifier.animateItem(),
-                                            onClick = { center ->
-                                                if (selectionMode || vm.showTrash) {
-                                                    vm.toggle(e.img.id)
-                                                } else {
-                                                    viewerOrigin = center
-                                                    viewer = e.index
-                                                }
-                                            },
-                                            onLongClick = { vm.toggle(e.img.id) },
-                                        )
+                            val entries = vm.entries
+                            if (entries.isEmpty()) {
+                                if (vm.showTrash) EmptyState(Icons.Outlined.Delete, "Корзина пуста")
+                                else EmptyState(Icons.Outlined.PhotoLibrary, "Фото не найдены")
+                            } else {
+                                val dense = columns >= 5
+                                val gap = if (dense) 2.dp else 4.dp
+                                val selectionMode = vm.selected.isNotEmpty()
+                                val gridState = when {
+                                    vm.tab == NavTab.TRASH -> trashGrid
+                                    vm.tab == NavTab.ALBUMS -> albumGrid
+                                    else -> galleryGrid
+                                }
+                                LazyVerticalGrid(
+                                    columns = GridCells.Fixed(columns),
+                                    state = gridState,
+                                    modifier = Modifier.fillMaxSize().pinchColumns(columns) { columns = it },
+                                    contentPadding = PaddingValues(start = 6.dp, end = 6.dp, top = 4.dp, bottom = 88.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(gap),
+                                    verticalArrangement = Arrangement.spacedBy(gap),
+                                ) {
+                                    items(
+                                        entries,
+                                        key = { it.key },
+                                        span = { e -> if (e is Header) GridItemSpan(maxLineSpan) else GridItemSpan(1) },
+                                    ) { e ->
+                                        when (e) {
+                                            is Header -> DayHeader(
+                                                label = e.label,
+                                                selectionMode = selectionMode,
+                                                allSelected = vm.selected.containsAll(e.ids),
+                                                modifier = Modifier.animateItem(),
+                                                onClick = { vm.toggleGroup(e.ids) },
+                                            )
+                                            is Photo -> Tile(
+                                                img = e.img,
+                                                trashMode = vm.showTrash,
+                                                selected = e.img.id in vm.selected,
+                                                selectionMode = selectionMode,
+                                                dense = dense,
+                                                modifier = Modifier.animateItem(),
+                                                onClick = { center ->
+                                                    if (selectionMode || vm.showTrash) {
+                                                        vm.toggle(e.img.id)
+                                                    } else {
+                                                        viewerOrigin = center
+                                                        viewer = e.index
+                                                    }
+                                                },
+                                                onLongClick = { vm.toggle(e.img.id) },
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -373,7 +435,7 @@ fun GalleryApp(vm: GalleryViewModel = viewModel()) {
                     SwitchRow("Оригиналы — в корзину", trashOrig) { trashOrig = it }
                     Text(
                         "Файлы до 300 КБ не пересжимаются — из них только удаляется EXIF. " +
-                            "Уже чистые файлы пропускаются. Дата съёмки сохраняется.",
+                            "Уже чистые файлы пропускаются. Дата съёмки сохраняется. Видео не затрагиваются.",
                         style = MaterialTheme.typography.bodySmall,
                         modifier = Modifier.padding(top = 8.dp),
                     )
@@ -416,21 +478,38 @@ fun SortMenu(vm: GalleryViewModel) {
 fun NavBar(vm: GalleryViewModel) {
     NavigationBar {
         NavigationBarItem(
-            selected = !vm.showTrash,
-            onClick = { vm.openTrash(false) },
+            selected = vm.tab == NavTab.GALLERY,
+            onClick = { vm.openTab(NavTab.GALLERY) },
             icon = {
-                Icon(if (!vm.showTrash) Icons.Filled.PhotoLibrary else Icons.Outlined.PhotoLibrary, null)
+                Icon(
+                    if (vm.tab == NavTab.GALLERY) Icons.Filled.PhotoLibrary else Icons.Outlined.PhotoLibrary,
+                    null,
+                )
             },
             label = { Text("Галерея") },
         )
         NavigationBarItem(
-            selected = vm.showTrash,
-            onClick = { vm.openTrash(true) },
+            selected = vm.tab == NavTab.ALBUMS,
+            onClick = { vm.openTab(NavTab.ALBUMS) },
+            icon = {
+                Icon(
+                    if (vm.tab == NavTab.ALBUMS) Icons.Filled.Folder else Icons.Outlined.Folder,
+                    null,
+                )
+            },
+            label = { Text("Альбомы") },
+        )
+        NavigationBarItem(
+            selected = vm.tab == NavTab.TRASH,
+            onClick = { vm.openTab(NavTab.TRASH) },
             icon = {
                 BadgedBox(badge = {
                     if (vm.trash.isNotEmpty()) Badge { Text("${vm.trash.size}") }
                 }) {
-                    Icon(if (vm.showTrash) Icons.Filled.Delete else Icons.Outlined.Delete, null)
+                    Icon(
+                        if (vm.tab == NavTab.TRASH) Icons.Filled.Delete else Icons.Outlined.Delete,
+                        null,
+                    )
                 }
             },
             label = { Text("Корзина") },
@@ -496,7 +575,7 @@ fun ActionBar(vm: GalleryViewModel, onCompress: () -> Unit) {
 }
 
 @Composable
-fun EmptyState(trash: Boolean) {
+fun EmptyState(icon: ImageVector, text: String) {
     val cs = MaterialTheme.colorScheme
     // Прокручиваемый, чтобы «потяни для обновления» работало и на пустом экране
     Column(
@@ -504,16 +583,69 @@ fun EmptyState(trash: Boolean) {
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Icon(
-            if (trash) Icons.Outlined.Delete else Icons.Outlined.PhotoLibrary,
-            null,
-            Modifier.size(72.dp),
-            tint = cs.outline,
-        )
+        Icon(icon, null, Modifier.size(72.dp), tint = cs.outline)
         Spacer(Modifier.height(12.dp))
+        Text(text, style = MaterialTheme.typography.titleMedium, color = cs.onSurfaceVariant)
+    }
+}
+
+// ---------------- Альбомы ----------------
+
+@Composable
+fun AlbumsGrid(vm: GalleryViewModel, state: LazyGridState) {
+    val albums = vm.albums
+    if (albums.isEmpty()) {
+        EmptyState(Icons.Outlined.Folder, "Альбомов нет")
+        return
+    }
+    LazyVerticalGrid(
+        columns = GridCells.Fixed(2),
+        state = state,
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 24.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        items(albums, key = { it.path }) { a ->
+            AlbumCard(a, Modifier.animateItem()) { vm.openAlbum(a.path) }
+        }
+    }
+}
+
+@Composable
+fun AlbumCard(album: Album, modifier: Modifier, onClick: () -> Unit) {
+    val cs = MaterialTheme.colorScheme
+    Column(
+        modifier
+            .clip(RoundedCornerShape(28.dp))
+            .clickable(onClick = onClick)
+    ) {
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .aspectRatio(1f)
+                .clip(RoundedCornerShape(28.dp))
+                .background(cs.surfaceContainerHigh)
+        ) {
+            AsyncImage(
+                model = album.cover.uri,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize(),
+            )
+        }
         Text(
-            if (trash) "Корзина пуста" else "Фото не найдены",
+            album.name,
+            Modifier.padding(start = 6.dp, top = 8.dp, end = 6.dp),
             style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Text(
+            "${album.count}",
+            Modifier.padding(start = 6.dp, bottom = 4.dp),
+            style = MaterialTheme.typography.bodySmall,
             color = cs.onSurfaceVariant,
         )
     }
@@ -523,7 +655,7 @@ fun EmptyState(trash: Boolean) {
 
 @Composable
 fun Viewer(vm: GalleryViewModel, start: Int, origin: Offset, onClose: () -> Unit) {
-    val list = vm.images
+    val list = vm.current
     if (list.isEmpty()) {
         LaunchedEffect(Unit) { onClose() }
         return
@@ -612,10 +744,15 @@ fun Viewer(vm: GalleryViewModel, start: Int, origin: Offset, onClose: () -> Unit
                 pageSpacing = 16.dp,
                 userScrollEnabled = !zoomed,
             ) { page ->
-                ZoomableImage(
-                    model = list[page].uri,
-                    onZoomChange = { if (page == pager.currentPage) zoomed = it },
-                )
+                val item = list[page]
+                if (item.isVideo) {
+                    VideoPage(item, active = page == pager.currentPage && !closing)
+                } else {
+                    ZoomableImage(
+                        model = item.uri,
+                        onZoomChange = { if (page == pager.currentPage) zoomed = it },
+                    )
+                }
             }
 
             val overlay = IconButtonDefaults.filledTonalIconButtonColors(
@@ -634,8 +771,9 @@ fun Viewer(vm: GalleryViewModel, start: Int, origin: Offset, onClose: () -> Unit
                 }
             }
 
+            // Подпись и подсказка — только для фото (у видео внизу своё управление)
             AnimatedVisibility(
-                visible = cur != null && !showInfo,
+                visible = cur != null && !showInfo && cur.isVideo.not(),
                 modifier = Modifier.align(Alignment.BottomCenter),
                 enter = fadeIn(),
                 exit = fadeOut(),
@@ -669,6 +807,149 @@ fun Viewer(vm: GalleryViewModel, start: Int, origin: Offset, onClose: () -> Unit
                 exit = slideOutVertically { it } + fadeOut(),
             ) {
                 if (cur != null) InfoPanel(cur, vm)
+            }
+        }
+    }
+}
+
+// ---------------- Видео ----------------
+
+/** Страница видео: постер всегда, а плеер поднимается только на активной странице */
+@Composable
+fun VideoPage(img: GalleryImage, active: Boolean) {
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        AsyncImage(
+            model = img.uri,
+            contentDescription = null,
+            contentScale = ContentScale.Fit,
+            modifier = Modifier.fillMaxSize(),
+        )
+        if (active) {
+            ActiveVideo(img)
+        } else {
+            Box(
+                Modifier.size(64.dp).clip(CircleShape).background(Color.Black.copy(alpha = 0.5f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(Icons.Filled.PlayArrow, null, tint = Color.White, modifier = Modifier.size(36.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun ActiveVideo(img: GalleryImage) {
+    val ctx = LocalContext.current
+    val player = remember(img.uri) {
+        ExoPlayer.Builder(ctx)
+            .setAudioAttributes(AudioAttributes.DEFAULT, true)
+            .build()
+            .apply {
+                setMediaItem(MediaItem.fromUri(img.uri))
+                prepare()
+                playWhenReady = true
+            }
+    }
+    DisposableEffect(player) { onDispose { player.release() } }
+    LifecycleEventEffect(Lifecycle.Event.ON_STOP) { player.pause() }
+
+    var playing by remember { mutableStateOf(true) }
+    var ended by remember { mutableStateOf(false) }
+    var ratio by remember { mutableFloatStateOf(16f / 9f) }
+    var pos by remember { mutableLongStateOf(0L) }
+    var dur by remember { mutableLongStateOf(img.duration) }
+    var seeking by remember { mutableStateOf(false) }
+    var controls by remember { mutableStateOf(true) }
+
+    DisposableEffect(player) {
+        val listener = object : Player.Listener {
+            override fun onIsPlayingChanged(isPlaying: Boolean) { playing = isPlaying }
+            override fun onVideoSizeChanged(videoSize: VideoSize) {
+                if (videoSize.width > 0 && videoSize.height > 0) {
+                    ratio = videoSize.width * videoSize.pixelWidthHeightRatio / videoSize.height
+                }
+            }
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                if (playbackState == Player.STATE_READY && player.duration > 0) dur = player.duration
+                ended = playbackState == Player.STATE_ENDED
+                if (ended) controls = true
+            }
+        }
+        player.addListener(listener)
+        onDispose { player.removeListener(listener) }
+    }
+    LaunchedEffect(player) {
+        while (true) {
+            if (!seeking) pos = player.currentPosition
+            delay(250)
+        }
+    }
+    // Управление прячется само через 3 секунды воспроизведения
+    LaunchedEffect(controls, playing) {
+        if (controls && playing) {
+            delay(3000)
+            controls = false
+        }
+    }
+
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        AndroidView(
+            factory = { c -> TextureView(c).also { player.setVideoTextureView(it) } },
+            modifier = Modifier.aspectRatio(ratio),
+        )
+        // Тап по видео показывает/прячет управление
+        Box(
+            Modifier
+                .fillMaxSize()
+                .pointerInput(Unit) { detectTapGestures(onTap = { controls = !controls }) }
+        )
+        AnimatedVisibility(
+            visible = controls,
+            modifier = Modifier.align(Alignment.BottomCenter),
+            enter = fadeIn(),
+            exit = fadeOut(),
+        ) {
+            Surface(
+                shape = RoundedCornerShape(32.dp),
+                color = Color.Black.copy(alpha = 0.6f),
+                modifier = Modifier.navigationBarsPadding().padding(horizontal = 16.dp, vertical = 20.dp),
+            ) {
+                Row(
+                    Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    IconButton(onClick = {
+                        when {
+                            ended -> { player.seekTo(0); player.play() }
+                            playing -> player.pause()
+                            else -> player.play()
+                        }
+                    }) {
+                        Icon(
+                            if (playing) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                            null,
+                            tint = Color.White,
+                        )
+                    }
+                    Text(
+                        formatDuration(pos),
+                        color = Color.White,
+                        style = MaterialTheme.typography.labelMedium,
+                    )
+                    Slider(
+                        value = pos.coerceIn(0L, dur.coerceAtLeast(1L)).toFloat(),
+                        onValueChange = { seeking = true; pos = it.toLong() },
+                        onValueChangeFinished = { player.seekTo(pos); seeking = false },
+                        valueRange = 0f..dur.coerceAtLeast(1L).toFloat(),
+                        modifier = Modifier.weight(1f).padding(horizontal = 8.dp),
+                    )
+                    Text(
+                        formatDuration(dur),
+                        color = Color.White,
+                        style = MaterialTheme.typography.labelMedium,
+                    )
+                    Spacer(Modifier.width(8.dp))
+                }
             }
         }
     }
@@ -768,6 +1049,10 @@ fun ZoomableImage(model: Any, onZoomChange: (Boolean) -> Unit) {
 fun InfoPanel(img: GalleryImage, vm: GalleryViewModel) {
     val cr = LocalContext.current.contentResolver
     val exif by produceState<List<Pair<String, String>>?>(null, img.uri, vm.exifVersion) {
+        if (img.isVideo) {
+            value = emptyList()
+            return@produceState
+        }
         value = null
         value = withContext(Dispatchers.IO) { ExifReader.read(cr, img.uri) }
     }
@@ -809,21 +1094,27 @@ fun InfoPanel(img: GalleryImage, vm: GalleryViewModel) {
                 InfoRow("Файл", img.name)
                 InfoRow("Размер", formatSize(img.size))
                 InfoRow("Тип", img.mime)
-                InfoRow("Папка", img.relativePath)
-                HorizontalDivider(Modifier.padding(vertical = 12.dp))
-                Text("EXIF", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                Spacer(Modifier.height(6.dp))
-                when {
-                    data == null -> Text("Загрузка…", color = cs.onSurfaceVariant)
-                    data.isEmpty() -> Text("Основных тегов EXIF не найдено", color = cs.onSurfaceVariant)
-                    else -> data.forEach { (k, v) -> InfoRow(k, v) }
+                InfoRow("Папка", img.relativePath.ifEmpty { "—" })
+                if (img.isVideo) {
+                    InfoRow("Длительность", formatDuration(img.duration))
+                } else {
+                    HorizontalDivider(Modifier.padding(vertical = 12.dp))
+                    Text("EXIF", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(6.dp))
+                    when {
+                        data == null -> Text("Загрузка…", color = cs.onSurfaceVariant)
+                        data.isEmpty() -> Text("Основных тегов EXIF не найдено", color = cs.onSurfaceVariant)
+                        else -> data.forEach { (k, v) -> InfoRow(k, v) }
+                    }
                 }
             }
 
-            Button(
-                onClick = { vm.requestClean(img) },
-                modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
-            ) { BtnLabel(Icons.Filled.CleaningServices, "Очистить EXIF") }
+            if (!img.isVideo) {
+                Button(
+                    onClick = { vm.requestClean(img) },
+                    modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+                ) { BtnLabel(Icons.Filled.CleaningServices, "Очистить EXIF") }
+            }
         }
     }
 }
@@ -930,7 +1221,7 @@ fun Tile(
             modifier = Modifier.fillMaxSize(),
         )
 
-        // В галерее на плитках нет веса и WEBP; в корзине — только срок до автоудаления
+        // В корзине — срок до автоудаления
         if (daysLeft >= 0 && !dense) {
             Text(
                 text = "$daysLeft дн.",
@@ -943,6 +1234,35 @@ fun Tile(
                     .background(cs.surface.copy(alpha = 0.75f))
                     .padding(horizontal = 8.dp, vertical = 2.dp),
             )
+        }
+
+        // Видео: значок ▶ и длительность
+        if (img.isVideo) {
+            if (dense) {
+                Icon(
+                    Icons.Filled.PlayArrow,
+                    null,
+                    tint = Color.White,
+                    modifier = Modifier.align(Alignment.BottomEnd).padding(2.dp).size(14.dp),
+                )
+            } else {
+                Row(
+                    Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(6.dp)
+                        .clip(CircleShape)
+                        .background(Color.Black.copy(alpha = 0.6f))
+                        .padding(horizontal = 6.dp, vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(Icons.Filled.PlayArrow, null, tint = Color.White, modifier = Modifier.size(14.dp))
+                    Text(
+                        formatDuration(img.duration),
+                        color = Color.White,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+            }
         }
 
         val mark = if (dense) 16.dp else 24.dp
