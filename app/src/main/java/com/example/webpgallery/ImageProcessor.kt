@@ -10,13 +10,14 @@ import androidx.exifinterface.media.ExifInterface
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 const val SIZE_LIMIT = 300L * 1024
 
 data class Options(
     val quality: Int = 80,
     val pngLossless: Boolean = false,
-    val deleteOriginals: Boolean = true,
+    val trashOriginals: Boolean = true,
 )
 
 data class Result(val before: Long, val after: Long)
@@ -44,7 +45,7 @@ object ImageProcessor {
         }
         // Маленькие файлы (или если WebP вышел не меньше) — без пересжатия, только чистим метаданные
         if (data == null) {
-            data = if (isPng) stripPng(bytes) else stripJpeg(cr, img.uri, bytes)
+            data = stripMetadata(cr, img.uri, img.mime, bytes)
         }
 
         val dir = if (img.relativePath.startsWith("DCIM") || img.relativePath.startsWith("Pictures"))
@@ -71,6 +72,20 @@ object ImageProcessor {
         return Result(bytes.size.toLong(), data.size.toLong())
     }
 
+    /** Очистка метаданных прямо в файле (нужен createWriteRequest). Всё считается в памяти до записи. */
+    fun cleanInPlace(cr: ContentResolver, uri: Uri, mime: String) {
+        val bytes = cr.openInputStream(uri)!!.use { it.readBytes() }
+        val clean = stripMetadata(cr, uri, mime, bytes)
+        cr.openOutputStream(uri, "wt")!!.use { it.write(clean) }
+    }
+
+    fun stripMetadata(cr: ContentResolver, uri: Uri, mime: String, bytes: ByteArray): ByteArray =
+        when (mime) {
+            "image/png" -> stripPng(bytes)
+            "image/webp" -> stripWebp(bytes)
+            else -> stripJpeg(cr, uri, bytes)
+        }
+
     // ---------- WebP ----------
 
     private fun toWebp(cr: ContentResolver, uri: Uri, isPng: Boolean, opt: Options): ByteArray {
@@ -90,6 +105,40 @@ object ImageProcessor {
         ImageDecoder.decodeBitmap(ImageDecoder.createSource(cr, uri)) { dec, _, _ ->
             dec.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
         }
+
+    // Удаляем чанки EXIF и XMP из RIFF-контейнера и сбрасываем флаги в VP8X
+    private fun stripWebp(src: ByteArray): ByteArray {
+        if (src.size < 12 ||
+            String(src, 0, 4, Charsets.ISO_8859_1) != "RIFF" ||
+            String(src, 8, 4, Charsets.ISO_8859_1) != "WEBP"
+        ) return src
+        val out = ByteArrayOutputStream(src.size)
+        out.write(src, 0, 12)
+        var i = 12
+        while (i + 8 <= src.size) {
+            val type = String(src, i, 4, Charsets.ISO_8859_1)
+            val len = ByteBuffer.wrap(src, i + 4, 4).order(ByteOrder.LITTLE_ENDIAN).int
+            val dataEnd = i + 8 + len
+            if (len < 0 || dataEnd > src.size) {
+                out.write(src, i, src.size - i)
+                break
+            }
+            val end = minOf(dataEnd + (len and 1), src.size)
+            when (type) {
+                "EXIF", "XMP " -> {}
+                "VP8X" -> {
+                    val chunk = src.copyOfRange(i, end)
+                    chunk[8] = (chunk[8].toInt() and 0x0C.inv()).toByte()
+                    out.write(chunk)
+                }
+                else -> out.write(src, i, end - i)
+            }
+            i = end
+        }
+        val res = out.toByteArray()
+        ByteBuffer.wrap(res, 4, 4).order(ByteOrder.LITTLE_ENDIAN).putInt(res.size - 8)
+        return res
+    }
 
     // ---------- JPEG: удаляем метаданные без перекодирования ----------
 
@@ -133,7 +182,7 @@ object ImageProcessor {
             if (!drop) out.write(src, i, end - i)
             i = end
         }
-        // Копируем сами данные до первого EOI, всё, что после (видео motion photo и т.п.), отбрасываем
+        // Копируем данные до первого EOI, всё что после (видео motion photo и т.п.) отбрасываем
         var j = i
         while (j + 1 < src.size && !(src[j] == 0xFF.toByte() && src[j + 1] == 0xD9.toByte())) j++
         val tail = if (j + 1 < src.size) j + 2 else src.size
