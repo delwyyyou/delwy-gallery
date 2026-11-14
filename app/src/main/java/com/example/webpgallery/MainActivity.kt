@@ -858,4 +858,115 @@ fun DayHeader(
             .clip(RoundedCornerShape(16.dp))
             .clickable(onClick = onClick)
             .padding(horizontal = 10.dp, vertical = 10.dp),
-        verticalAlignment =
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            label,
+            Modifier.weight(1f),
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.Bold,
+        )
+        if (selectionMode) {
+            Icon(
+                if (allSelected) Icons.Filled.CheckCircle else Icons.Outlined.RadioButtonUnchecked,
+                null,
+                tint = if (allSelected) cs.primary else cs.outline,
+            )
+        }
+    }
+}
+
+@Composable
+fun SwitchRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(label, Modifier.weight(1f))
+        Switch(checked = checked, onCheckedChange = onChange)
+    }
+}
+
+@Composable
+fun Tile(
+    img: GalleryImage,
+    trashMode: Boolean,
+    selected: Boolean,
+    selectionMode: Boolean,
+    dense: Boolean,
+    modifier: Modifier,
+    onClick: (Offset) -> Unit,
+    onLongClick: () -> Unit,
+) {
+    val scale by animateFloatAsState(
+        if (selected) 0.86f else 1f,
+        spring(Spring.DampingRatioMediumBouncy, Spring.StiffnessMedium),
+        label = "scale",
+    )
+    val corner by animateDpAsState(
+        when {
+            selected -> if (dense) 14.dp else 32.dp
+            else -> if (dense) 6.dp else 20.dp
+        },
+        label = "corner",
+    )
+    val cs = MaterialTheme.colorScheme
+    var center by remember { mutableStateOf(Offset.Zero) }
+
+    val daysLeft = if (trashMode && img.expires > 0)
+        ((img.expires * 1000 - System.currentTimeMillis()) / 86_400_000L + 1).coerceAtLeast(0)
+    else -1L
+
+    Box(
+        modifier
+            .aspectRatio(1f)
+            .graphicsLayer { scaleX = scale; scaleY = scale }
+            .clip(RoundedCornerShape(corner))
+            .background(cs.surfaceContainerHigh)
+            .onGloballyPositioned { center = it.boundsInRoot().center }
+            .combinedClickable(onClick = { onClick(center) }, onLongClick = onLongClick)
+    ) {
+        AsyncImage(
+            model = img.uri,
+            contentDescription = null,
+            contentScale = ContentScale.Crop,
+            modifier = Modifier.fillMaxSize(),
+        )
+
+        // В галерее на плитках нет веса и WEBP; в корзине — только срок до автоудаления
+        if (daysLeft >= 0 && !dense) {
+            Text(
+                text = "$daysLeft дн.",
+                style = MaterialTheme.typography.labelSmall,
+                color = cs.onSurface,
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(6.dp)
+                    .clip(CircleShape)
+                    .background(cs.surface.copy(alpha = 0.75f))
+                    .padding(horizontal = 8.dp, vertical = 2.dp),
+            )
+        }
+
+        val mark = if (dense) 16.dp else 24.dp
+        val markPad = if (dense) 4.dp else 8.dp
+        if (selected) {
+            Box(
+                Modifier
+                    .align(Alignment.TopStart)
+                    .padding(markPad)
+                    .size(mark)
+                    .clip(CircleShape)
+                    .background(cs.primary),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(Icons.Filled.Check, null, tint = cs.onPrimary, modifier = Modifier.size(mark - 8.dp))
+            }
+        } else if (selectionMode) {
+            Box(
+                Modifier
+                    .align(Alignment.TopStart)
+                    .padding(markPad)
+                    .size(mark)
+                    .border(2.dp, Color.White.copy(alpha = 0.85f), CircleShape)
+            )
+        }
+    }
+}
