@@ -24,6 +24,7 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 
+/** Фото или видео */
 data class GalleryImage(
     val id: Long,
     val uri: Uri,
@@ -33,14 +34,20 @@ data class GalleryImage(
     val dateTaken: Long,    // мс, может быть 0
     val dateModified: Long, // секунды
     val relativePath: String,
-    val expires: Long,      // секунды; для фото в корзине — когда удалится само
+    val expires: Long,      // секунды; для элементов в корзине — когда удалятся сами
+    val duration: Long,     // мс, только для видео
 ) {
+    val isVideo get() = mime.startsWith("video/")
     val canProcess get() = mime == "image/jpeg" || mime == "image/png"
     val isBig get() = canProcess && size > SIZE_LIMIT
 
     /** Дата для сортировки: съёмка, а если её нет — время изменения (мс) */
     val date: Long get() = if (dateTaken > 0) dateTaken else dateModified * 1000
 }
+
+data class Album(val path: String, val name: String, val count: Int, val cover: GalleryImage)
+
+enum class NavTab { GALLERY, ALBUMS, TRASH }
 
 enum class SortMode(val label: String) {
     DATE_DESC("Сначала новые"),
@@ -58,6 +65,22 @@ data class Photo(val img: GalleryImage, val index: Int) : Entry {
 
 fun formatSize(b: Long): String =
     if (b >= 1_048_576) String.format("%.1f МБ", b / 1_048_576.0) else "${b / 1024} КБ"
+
+fun formatDuration(ms: Long): String {
+    val s = (ms / 1000).coerceAtLeast(0)
+    val h = s / 3600
+    val m = (s % 3600) / 60
+    val sec = s % 60
+    return if (h > 0) String.format("%d:%02d:%02d", h, m, sec) else String.format("%d:%02d", m, sec)
+}
+
+fun albumName(path: String): String =
+    path.trimEnd('/').substringAfterLast('/').ifEmpty { "Корень" }
+
+fun buildAlbums(list: List<GalleryImage>): List<Album> =
+    list.groupBy { it.relativePath }
+        .map { (path, items) -> Album(path, albumName(path), items.size, items.maxBy { it.date }) }
+        .sortedByDescending { it.cover.date }
 
 fun dayLabel(ms: Long): String {
     val date = Instant.ofEpochMilli(ms).atZone(ZoneId.systemDefault()).toLocalDate()
@@ -84,16 +107,25 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
 
     private enum class Op { TRASH, RESTORE, DELETE }
 
+    /** Все фото и видео (имя осталось с прежних времён) */
     var images by mutableStateOf<List<GalleryImage>>(emptyList()); private set
     var trash by mutableStateOf<List<GalleryImage>>(emptyList()); private set
+    var albums by mutableStateOf<List<Album>>(emptyList()); private set
+
+    /** То, что сейчас показано в сетке: галерея, открытый альбом или корзина */
+    var current by mutableStateOf<List<GalleryImage>>(emptyList()); private set
     var entries by mutableStateOf<List<Entry>>(emptyList()); private set
+
+    var tab by mutableStateOf(NavTab.GALLERY); private set
+    var album by mutableStateOf<String?>(null); private set
     var selected by mutableStateOf<Set<Long>>(emptySet()); private set
     var progress by mutableStateOf<Pair<Int, Int>?>(null); private set
-    var showTrash by mutableStateOf(false); private set
     var sort by mutableStateOf(SortMode.DATE_DESC); private set
     var refreshing by mutableStateOf(false); private set
     var exifVersion by mutableIntStateOf(0); private set
     var message by mutableStateOf<String?>(null)
+
+    val showTrash: Boolean get() = tab == NavTab.TRASH
 
     /** Корзина / восстановление / удаление навсегда — после результата вызываем onSystemResult */
     val request = MutableSharedFlow<IntentSender>(extraBufferCapacity = 1)
@@ -110,8 +142,6 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
     private var inFlight = false
 
     private val cr: ContentResolver get() = getApplication<Application>().contentResolver
-
-    val current: List<GalleryImage> get() = if (showTrash) trash else images
 
     // ---------- Загрузка, обновление и сортировка ----------
 
@@ -156,15 +186,39 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
     private fun rebuild() {
         images = sorted(rawImages)
         trash = sorted(rawTrash)
+        albums = buildAlbums(rawImages)
+        // если открытый альбом опустел — возвращаемся к списку альбомов
+        if (album != null && albums.none { it.path == album }) album = null
         rebuildEntries()
     }
 
     private fun rebuildEntries() {
+        val a = album
+        current = when (tab) {
+            NavTab.GALLERY -> images
+            NavTab.TRASH -> trash
+            NavTab.ALBUMS -> if (a == null) emptyList() else images.filter { it.relativePath == a }
+        }
         entries = buildEntries(current, sort != SortMode.SIZE_DESC)
     }
 
-    fun openTrash(open: Boolean) {
-        showTrash = open
+    // ---------- Вкладки и альбомы ----------
+
+    fun openTab(t: NavTab) {
+        tab = t
+        album = null
+        selected = emptySet()
+        rebuildEntries()
+    }
+
+    fun openAlbum(path: String) {
+        album = path
+        selected = emptySet()
+        rebuildEntries()
+    }
+
+    fun closeAlbum() {
+        album = null
         selected = emptySet()
         rebuildEntries()
     }
@@ -312,25 +366,31 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
     // ---------- MediaStore ----------
 
     private fun query(trashed: Boolean): List<GalleryImage> {
-        val coll = MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+        val coll = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL)
+        val imageBase = MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+        val videoBase = MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
         val proj = arrayOf(
-            MediaStore.Images.Media._ID,
-            MediaStore.Images.Media.DISPLAY_NAME,
-            MediaStore.Images.Media.MIME_TYPE,
-            MediaStore.Images.Media.SIZE,
-            MediaStore.Images.Media.DATE_TAKEN,
-            MediaStore.Images.Media.DATE_MODIFIED,
-            MediaStore.Images.Media.RELATIVE_PATH,
+            MediaStore.MediaColumns._ID,
+            MediaStore.MediaColumns.DISPLAY_NAME,
+            MediaStore.MediaColumns.MIME_TYPE,
+            MediaStore.MediaColumns.SIZE,
+            MediaStore.MediaColumns.DATE_TAKEN,
+            MediaStore.MediaColumns.DATE_MODIFIED,
+            MediaStore.MediaColumns.RELATIVE_PATH,
             MediaStore.MediaColumns.DATE_EXPIRES,
+            MediaStore.MediaColumns.DURATION,
         )
         val args = Bundle().apply {
             putString(
                 ContentResolver.QUERY_ARG_SQL_SELECTION,
-                "${MediaStore.Images.Media.MIME_TYPE} IN (?,?,?)"
+                "${MediaStore.Files.FileColumns.MEDIA_TYPE} IN (?,?)"
             )
             putStringArray(
                 ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS,
-                arrayOf("image/jpeg", "image/png", "image/webp")
+                arrayOf(
+                    MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE.toString(),
+                    MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO.toString(),
+                )
             )
             putInt(
                 MediaStore.QUERY_ARG_MATCH_TRASHED,
@@ -339,26 +399,30 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
         }
         val out = mutableListOf<GalleryImage>()
         cr.query(coll, proj, args, null)?.use { c ->
-            val iId = c.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
-            val iName = c.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
-            val iMime = c.getColumnIndexOrThrow(MediaStore.Images.Media.MIME_TYPE)
-            val iSize = c.getColumnIndexOrThrow(MediaStore.Images.Media.SIZE)
-            val iTaken = c.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_TAKEN)
-            val iMod = c.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_MODIFIED)
-            val iPath = c.getColumnIndexOrThrow(MediaStore.Images.Media.RELATIVE_PATH)
+            val iId = c.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
+            val iName = c.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
+            val iMime = c.getColumnIndexOrThrow(MediaStore.MediaColumns.MIME_TYPE)
+            val iSize = c.getColumnIndexOrThrow(MediaStore.MediaColumns.SIZE)
+            val iTaken = c.getColumnIndexOrThrow(MediaStore.MediaColumns.DATE_TAKEN)
+            val iMod = c.getColumnIndexOrThrow(MediaStore.MediaColumns.DATE_MODIFIED)
+            val iPath = c.getColumnIndexOrThrow(MediaStore.MediaColumns.RELATIVE_PATH)
             val iExp = c.getColumnIndexOrThrow(MediaStore.MediaColumns.DATE_EXPIRES)
+            val iDur = c.getColumnIndexOrThrow(MediaStore.MediaColumns.DURATION)
             while (c.moveToNext()) {
                 val id = c.getLong(iId)
+                val mime = c.getString(iMime) ?: "image/jpeg"
+                val base = if (mime.startsWith("video/")) videoBase else imageBase
                 out += GalleryImage(
                     id = id,
-                    uri = ContentUris.withAppendedId(coll, id),
-                    name = c.getString(iName) ?: "image",
-                    mime = c.getString(iMime) ?: "image/jpeg",
+                    uri = ContentUris.withAppendedId(base, id),
+                    name = c.getString(iName) ?: "file",
+                    mime = mime,
                     size = c.getLong(iSize),
                     dateTaken = c.getLong(iTaken),
                     dateModified = c.getLong(iMod),
-                    relativePath = c.getString(iPath) ?: "Pictures/",
+                    relativePath = c.getString(iPath) ?: "",
                     expires = c.getLong(iExp),
+                    duration = c.getLong(iDur),
                 )
             }
         }
