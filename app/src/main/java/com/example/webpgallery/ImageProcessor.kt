@@ -21,7 +21,7 @@ data class Options(
     val trashOriginals: Boolean = true,
 )
 
-data class Result(val before: Long, val after: Long)
+data class Result(val before: Long, val after: Long, val skipped: Boolean = false)
 
 object ImageProcessor {
 
@@ -47,6 +47,11 @@ object ImageProcessor {
         // Маленькие файлы (или если WebP вышел не меньше) — без пересжатия, только чистим метаданные
         if (data == null) {
             data = stripMetadata(cr, img.uri, img.mime, bytes)
+        }
+
+        // Нечего чистить и сжимать — ничего не создаём и оригинал не трогаем
+        if (outMime == img.mime && data.size == bytes.size) {
+            return Result(bytes.size.toLong(), bytes.size.toLong(), skipped = true)
         }
 
         val dir = if (img.relativePath.startsWith("DCIM") || img.relativePath.startsWith("Pictures"))
