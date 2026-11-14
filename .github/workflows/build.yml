@@ -1,0 +1,55 @@
+name: Build release APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      # Ключ хранится в кэше, поэтому подпись одинаковая во всех сборках
+      - name: Restore keystore cache
+        id: ks-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.release-keystore
+          key: release-keystore-v1
+
+      - name: Generate keystore (only if missing)
+        if: steps.ks-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.release-keystore
+          PASS=$(openssl rand -hex 16)
+          echo "$PASS" > ~/.release-keystore/password.txt
+          keytool -genkeypair -v \
+            -keystore ~/.release-keystore/release.jks \
+            -alias release \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass "$PASS" -keypass "$PASS" \
+            -dname "CN=WebP Gallery, O=Personal, C=RU"
+
+      - name: Export signing env
+        run: |
+          echo "KEYSTORE_PATH=$HOME/.release-keystore/release.jks" >> "$GITHUB_ENV"
+          echo "KEYSTORE_PASSWORD=$(cat ~/.release-keystore/password.txt)" >> "$GITHUB_ENV"
+
+      - name: Build release
+        run: gradle assembleRelease --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: webp-gallery-release
+          path: app/build/outputs/apk/release/*.apk
