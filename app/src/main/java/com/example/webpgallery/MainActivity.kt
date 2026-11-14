@@ -71,6 +71,7 @@ import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material.icons.outlined.RadioButtonUnchecked
 import androidx.compose.material3.*
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -281,51 +282,58 @@ fun GalleryApp(vm: GalleryViewModel = viewModel()) {
                         }
                     }
                 } else {
-                    val entries = vm.entries
-                    if (entries.isEmpty()) {
-                        EmptyState(vm.showTrash)
-                    } else {
-                        val dense = columns >= 5
-                        val gap = if (dense) 2.dp else 4.dp
-                        val selectionMode = vm.selected.isNotEmpty()
-                        LazyVerticalGrid(
-                            columns = GridCells.Fixed(columns),
-                            state = if (vm.showTrash) trashGrid else galleryGrid,
-                            modifier = Modifier.fillMaxSize().pinchColumns(columns) { columns = it },
-                            contentPadding = PaddingValues(start = 6.dp, end = 6.dp, top = 4.dp, bottom = 88.dp),
-                            horizontalArrangement = Arrangement.spacedBy(gap),
-                            verticalArrangement = Arrangement.spacedBy(gap),
-                        ) {
-                            items(
-                                entries,
-                                key = { it.key },
-                                span = { e -> if (e is Header) GridItemSpan(maxLineSpan) else GridItemSpan(1) },
-                            ) { e ->
-                                when (e) {
-                                    is Header -> DayHeader(
-                                        label = e.label,
-                                        selectionMode = selectionMode,
-                                        allSelected = vm.selected.containsAll(e.ids),
-                                        modifier = Modifier.animateItem(),
-                                        onClick = { vm.toggleGroup(e.ids) },
-                                    )
-                                    is Photo -> Tile(
-                                        img = e.img,
-                                        trashMode = vm.showTrash,
-                                        selected = e.img.id in vm.selected,
-                                        selectionMode = selectionMode,
-                                        dense = dense,
-                                        modifier = Modifier.animateItem(),
-                                        onClick = { center ->
-                                            if (selectionMode || vm.showTrash) {
-                                                vm.toggle(e.img.id)
-                                            } else {
-                                                viewerOrigin = center
-                                                viewer = e.index
-                                            }
-                                        },
-                                        onLongClick = { vm.toggle(e.img.id) },
-                                    )
+                    // Потяните вниз от верха списка — галерея обновится
+                    PullToRefreshBox(
+                        isRefreshing = vm.refreshing,
+                        onRefresh = vm::refresh,
+                        modifier = Modifier.fillMaxSize(),
+                    ) {
+                        val entries = vm.entries
+                        if (entries.isEmpty()) {
+                            EmptyState(vm.showTrash)
+                        } else {
+                            val dense = columns >= 5
+                            val gap = if (dense) 2.dp else 4.dp
+                            val selectionMode = vm.selected.isNotEmpty()
+                            LazyVerticalGrid(
+                                columns = GridCells.Fixed(columns),
+                                state = if (vm.showTrash) trashGrid else galleryGrid,
+                                modifier = Modifier.fillMaxSize().pinchColumns(columns) { columns = it },
+                                contentPadding = PaddingValues(start = 6.dp, end = 6.dp, top = 4.dp, bottom = 88.dp),
+                                horizontalArrangement = Arrangement.spacedBy(gap),
+                                verticalArrangement = Arrangement.spacedBy(gap),
+                            ) {
+                                items(
+                                    entries,
+                                    key = { it.key },
+                                    span = { e -> if (e is Header) GridItemSpan(maxLineSpan) else GridItemSpan(1) },
+                                ) { e ->
+                                    when (e) {
+                                        is Header -> DayHeader(
+                                            label = e.label,
+                                            selectionMode = selectionMode,
+                                            allSelected = vm.selected.containsAll(e.ids),
+                                            modifier = Modifier.animateItem(),
+                                            onClick = { vm.toggleGroup(e.ids) },
+                                        )
+                                        is Photo -> Tile(
+                                            img = e.img,
+                                            trashMode = vm.showTrash,
+                                            selected = e.img.id in vm.selected,
+                                            selectionMode = selectionMode,
+                                            dense = dense,
+                                            modifier = Modifier.animateItem(),
+                                            onClick = { center ->
+                                                if (selectionMode || vm.showTrash) {
+                                                    vm.toggle(e.img.id)
+                                                } else {
+                                                    viewerOrigin = center
+                                                    viewer = e.index
+                                                }
+                                            },
+                                            onLongClick = { vm.toggle(e.img.id) },
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -490,8 +498,9 @@ fun ActionBar(vm: GalleryViewModel, onCompress: () -> Unit) {
 @Composable
 fun EmptyState(trash: Boolean) {
     val cs = MaterialTheme.colorScheme
+    // Прокручиваемый, чтобы «потяни для обновления» работало и на пустом экране
     Column(
-        Modifier.fillMaxSize(),
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
@@ -849,115 +858,4 @@ fun DayHeader(
             .clip(RoundedCornerShape(16.dp))
             .clickable(onClick = onClick)
             .padding(horizontal = 10.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Text(
-            label,
-            Modifier.weight(1f),
-            style = MaterialTheme.typography.titleSmall,
-            fontWeight = FontWeight.Bold,
-        )
-        if (selectionMode) {
-            Icon(
-                if (allSelected) Icons.Filled.CheckCircle else Icons.Outlined.RadioButtonUnchecked,
-                null,
-                tint = if (allSelected) cs.primary else cs.outline,
-            )
-        }
-    }
-}
-
-@Composable
-fun SwitchRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
-    Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-        Text(label, Modifier.weight(1f))
-        Switch(checked = checked, onCheckedChange = onChange)
-    }
-}
-
-@Composable
-fun Tile(
-    img: GalleryImage,
-    trashMode: Boolean,
-    selected: Boolean,
-    selectionMode: Boolean,
-    dense: Boolean,
-    modifier: Modifier,
-    onClick: (Offset) -> Unit,
-    onLongClick: () -> Unit,
-) {
-    val scale by animateFloatAsState(
-        if (selected) 0.86f else 1f,
-        spring(Spring.DampingRatioMediumBouncy, Spring.StiffnessMedium),
-        label = "scale",
-    )
-    val corner by animateDpAsState(
-        when {
-            selected -> if (dense) 14.dp else 32.dp
-            else -> if (dense) 6.dp else 20.dp
-        },
-        label = "corner",
-    )
-    val cs = MaterialTheme.colorScheme
-    var center by remember { mutableStateOf(Offset.Zero) }
-
-    val daysLeft = if (trashMode && img.expires > 0)
-        ((img.expires * 1000 - System.currentTimeMillis()) / 86_400_000L + 1).coerceAtLeast(0)
-    else -1L
-
-    Box(
-        modifier
-            .aspectRatio(1f)
-            .graphicsLayer { scaleX = scale; scaleY = scale }
-            .clip(RoundedCornerShape(corner))
-            .background(cs.surfaceContainerHigh)
-            .onGloballyPositioned { center = it.boundsInRoot().center }
-            .combinedClickable(onClick = { onClick(center) }, onLongClick = onLongClick)
-    ) {
-        AsyncImage(
-            model = img.uri,
-            contentDescription = null,
-            contentScale = ContentScale.Crop,
-            modifier = Modifier.fillMaxSize(),
-        )
-
-        // В галерее на плитках больше нет веса и WEBP; в корзине — только срок до автоудаления
-        if (daysLeft >= 0 && !dense) {
-            Text(
-                text = "$daysLeft дн.",
-                style = MaterialTheme.typography.labelSmall,
-                color = cs.onSurface,
-                modifier = Modifier
-                    .align(Alignment.BottomStart)
-                    .padding(6.dp)
-                    .clip(CircleShape)
-                    .background(cs.surface.copy(alpha = 0.75f))
-                    .padding(horizontal = 8.dp, vertical = 2.dp),
-            )
-        }
-
-        val mark = if (dense) 16.dp else 24.dp
-        val markPad = if (dense) 4.dp else 8.dp
-        if (selected) {
-            Box(
-                Modifier
-                    .align(Alignment.TopStart)
-                    .padding(markPad)
-                    .size(mark)
-                    .clip(CircleShape)
-                    .background(cs.primary),
-                contentAlignment = Alignment.Center,
-            ) {
-                Icon(Icons.Filled.Check, null, tint = cs.onPrimary, modifier = Modifier.size(mark - 8.dp))
-            }
-        } else if (selectionMode) {
-            Box(
-                Modifier
-                    .align(Alignment.TopStart)
-                    .padding(markPad)
-                    .size(mark)
-                    .border(2.dp, Color.White.copy(alpha = 0.85f), CircleShape)
-            )
-        }
-    }
-}
+        verticalAlignment =
