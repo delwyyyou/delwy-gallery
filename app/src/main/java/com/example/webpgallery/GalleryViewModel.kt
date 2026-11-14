@@ -1,11 +1,14 @@
 package com.example.webpgallery
 
 import android.app.Application
+import android.content.ContentResolver
 import android.content.ContentUris
 import android.content.IntentSender
 import android.net.Uri
+import android.os.Bundle
 import android.provider.MediaStore
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
@@ -23,6 +26,7 @@ data class GalleryImage(
     val size: Long,
     val dateTaken: Long,
     val relativePath: String,
+    val expires: Long, // секунды; для фото в корзине — когда удалится само
 ) {
     val canProcess get() = mime == "image/jpeg" || mime == "image/png"
     val isBig get() = canProcess && size > SIZE_LIMIT
@@ -34,49 +38,112 @@ fun formatSize(b: Long): String =
 class GalleryViewModel(app: Application) : AndroidViewModel(app) {
 
     var images by mutableStateOf<List<GalleryImage>>(emptyList()); private set
+    var trash by mutableStateOf<List<GalleryImage>>(emptyList()); private set
     var selected by mutableStateOf<Set<Long>>(emptySet()); private set
     var progress by mutableStateOf<Pair<Int, Int>?>(null); private set
-    var onlyBig by mutableStateOf(false)
+    var showTrash by mutableStateOf(false); private set
+    var exifVersion by mutableIntStateOf(0); private set
     var message by mutableStateOf<String?>(null)
 
-    val deleteRequest = MutableSharedFlow<IntentSender>(extraBufferCapacity = 1)
+    /** Корзина / восстановление / удаление навсегда — после результата просто перезагружаем список */
+    val request = MutableSharedFlow<IntentSender>(extraBufferCapacity = 1)
 
-    val visible: List<GalleryImage>
-        get() = if (onlyBig) images.filter { it.isBig } else images
+    /** Запрос на запись в файл (очистка EXIF) */
+    val cleanRequest = MutableSharedFlow<IntentSender>(extraBufferCapacity = 1)
+
+    private var pendingClean: GalleryImage? = null
+    private val cr: ContentResolver get() = getApplication<Application>().contentResolver
+
+    val current: List<GalleryImage> get() = if (showTrash) trash else images
 
     fun load() {
         viewModelScope.launch {
-            images = withContext(Dispatchers.IO) { query() }
-            val ids = images.map { it.id }.toSet()
+            val (a, t) = withContext(Dispatchers.IO) { query(false) to query(true) }
+            images = a
+            trash = t
+            val ids = current.map { it.id }.toSet()
             selected = selected.filter { it in ids }.toSet()
         }
     }
 
+    fun openTrash(open: Boolean) {
+        showTrash = open
+        selected = emptySet()
+    }
+
     fun toggle(id: Long) {
-        if (images.none { it.id == id && it.canProcess }) return
         selected = if (id in selected) selected - id else selected + id
     }
 
     fun clearSelection() { selected = emptySet() }
 
-    fun selectBig() { selected = images.filter { it.isBig }.map { it.id }.toSet() }
+    fun selectAll() { selected = current.map { it.id }.toSet() }
+
+    private fun selectedUris(): List<Uri> = current.filter { it.id in selected }.map { it.uri }
+
+    /** true — в корзину, false — восстановить */
+    fun moveSelected(toTrash: Boolean) {
+        val uris = selectedUris()
+        if (uris.isEmpty()) return
+        viewModelScope.launch {
+            request.emit(MediaStore.createTrashRequest(cr, uris, toTrash).intentSender)
+        }
+    }
+
+    fun deleteSelectedForever() {
+        val uris = selectedUris()
+        if (uris.isEmpty()) return
+        viewModelScope.launch {
+            request.emit(MediaStore.createDeleteRequest(cr, uris).intentSender)
+        }
+    }
+
+    // ---------- Очистка EXIF прямо в файле ----------
+
+    fun requestClean(img: GalleryImage) {
+        pendingClean = img
+        viewModelScope.launch {
+            cleanRequest.emit(MediaStore.createWriteRequest(cr, listOf(img.uri)).intentSender)
+        }
+    }
+
+    fun onCleanResult(ok: Boolean) {
+        val img = pendingClean ?: return
+        pendingClean = null
+        if (!ok) return
+        viewModelScope.launch {
+            message = try {
+                withContext(Dispatchers.IO) { ImageProcessor.cleanInPlace(cr, img.uri, img.mime) }
+                "EXIF очищен"
+            } catch (e: Throwable) {
+                "Не удалось очистить EXIF"
+            }
+            exifVersion++
+            load()
+        }
+    }
+
+    // ---------- Сжатие ----------
 
     fun run(opt: Options) {
         val list = images.filter { it.id in selected && it.canProcess }
-        if (list.isEmpty() || progress != null) return
+        if (progress != null) return
+        if (list.isEmpty()) {
+            message = "Среди выбранных нет JPEG/PNG"
+            return
+        }
         viewModelScope.launch {
-            val cr = getApplication<Application>().contentResolver
             var saved = 0L
             var ok = 0
             var fail = 0
-            val toDelete = mutableListOf<Uri>()
+            val processed = mutableListOf<Uri>()
             list.forEachIndexed { idx, img ->
                 progress = idx to list.size
                 try {
                     val r = withContext(Dispatchers.IO) { ImageProcessor.process(cr, img, opt) }
                     saved += r.before - r.after
                     ok++
-                    toDelete += img.uri
+                    processed += img.uri
                 } catch (e: Throwable) {
                     fail++
                 }
@@ -85,15 +152,15 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
             selected = emptySet()
             message = "Готово: $ok, ошибок: $fail. Освобождено ${formatSize(saved)}"
             load()
-            if (opt.deleteOriginals && toDelete.isNotEmpty()) {
-                // Системный диалог подтверждения удаления оригиналов
-                deleteRequest.emit(MediaStore.createDeleteRequest(cr, toDelete).intentSender)
+            if (opt.trashOriginals && processed.isNotEmpty()) {
+                request.emit(MediaStore.createTrashRequest(cr, processed, true).intentSender)
             }
         }
     }
 
-    private fun query(): List<GalleryImage> {
-        val cr = getApplication<Application>().contentResolver
+    // ---------- MediaStore ----------
+
+    private fun query(trashed: Boolean): List<GalleryImage> {
         val coll = MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
         val proj = arrayOf(
             MediaStore.Images.Media._ID,
@@ -102,17 +169,35 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
             MediaStore.Images.Media.SIZE,
             MediaStore.Images.Media.DATE_TAKEN,
             MediaStore.Images.Media.RELATIVE_PATH,
+            MediaStore.MediaColumns.DATE_EXPIRES,
         )
-        val sel = "${MediaStore.Images.Media.MIME_TYPE} IN (?,?,?)"
-        val args = arrayOf("image/jpeg", "image/png", "image/webp")
+        val args = Bundle().apply {
+            putString(
+                ContentResolver.QUERY_ARG_SQL_SELECTION,
+                "${MediaStore.Images.Media.MIME_TYPE} IN (?,?,?)"
+            )
+            putStringArray(
+                ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS,
+                arrayOf("image/jpeg", "image/png", "image/webp")
+            )
+            putString(
+                ContentResolver.QUERY_ARG_SQL_SORT_ORDER,
+                "${MediaStore.Images.Media.DATE_ADDED} DESC"
+            )
+            putInt(
+                MediaStore.QUERY_ARG_MATCH_TRASHED,
+                if (trashed) MediaStore.MATCH_ONLY else MediaStore.MATCH_EXCLUDE
+            )
+        }
         val out = mutableListOf<GalleryImage>()
-        cr.query(coll, proj, sel, args, "${MediaStore.Images.Media.DATE_ADDED} DESC")?.use { c ->
+        cr.query(coll, proj, args, null)?.use { c ->
             val iId = c.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
             val iName = c.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
             val iMime = c.getColumnIndexOrThrow(MediaStore.Images.Media.MIME_TYPE)
             val iSize = c.getColumnIndexOrThrow(MediaStore.Images.Media.SIZE)
             val iTaken = c.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_TAKEN)
             val iPath = c.getColumnIndexOrThrow(MediaStore.Images.Media.RELATIVE_PATH)
+            val iExp = c.getColumnIndexOrThrow(MediaStore.MediaColumns.DATE_EXPIRES)
             while (c.moveToNext()) {
                 val id = c.getLong(iId)
                 out += GalleryImage(
@@ -123,6 +208,7 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
                     size = c.getLong(iSize),
                     dateTaken = c.getLong(iTaken),
                     relativePath = c.getString(iPath) ?: "Pictures/",
+                    expires = c.getLong(iExp),
                 )
             }
         }
