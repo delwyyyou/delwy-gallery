@@ -118,7 +118,7 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun setSort(mode: SortMode) {
+    fun changeSort(mode: SortMode) {
         sort = mode
         rebuild()
     }
