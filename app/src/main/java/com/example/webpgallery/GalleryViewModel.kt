@@ -91,6 +91,7 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
     var progress by mutableStateOf<Pair<Int, Int>?>(null); private set
     var showTrash by mutableStateOf(false); private set
     var sort by mutableStateOf(SortMode.DATE_DESC); private set
+    var refreshing by mutableStateOf(false); private set
     var exifVersion by mutableIntStateOf(0); private set
     var message by mutableStateOf<String?>(null)
 
@@ -112,16 +113,32 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
 
     val current: List<GalleryImage> get() = if (showTrash) trash else images
 
-    // ---------- Загрузка и сортировка ----------
+    // ---------- Загрузка, обновление и сортировка ----------
+
+    private suspend fun reload() {
+        val (a, t) = withContext(Dispatchers.IO) { query(false) to query(true) }
+        rawImages = a
+        rawTrash = t
+        rebuild()
+        val ids = current.map { it.id }.toSet()
+        selected = selected.filter { it in ids }.toSet()
+    }
 
     fun load() {
+        viewModelScope.launch { reload() }
+    }
+
+    /** «Потяни для обновления» */
+    fun refresh() {
+        if (refreshing) return
         viewModelScope.launch {
-            val (a, t) = withContext(Dispatchers.IO) { query(false) to query(true) }
-            rawImages = a
-            rawTrash = t
-            rebuild()
-            val ids = current.map { it.id }.toSet()
-            selected = selected.filter { it in ids }.toSet()
+            refreshing = true
+            try {
+                reload()
+                delay(400) // чтобы индикатор не мигал слишком быстро
+            } finally {
+                refreshing = false
+            }
         }
     }
 
