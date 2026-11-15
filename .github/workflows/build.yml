@@ -20,7 +20,6 @@ jobs:
         with:
           gradle-version: 8.9
 
-      # Ключ хранится в кэше, поэтому подпись одинаковая во всех сборках
       - name: Restore keystore cache
         id: ks-cache
         uses: actions/cache@v4
