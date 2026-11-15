@@ -1,6 +1,6 @@
 # Delwy Gallery
 
-A lightweight, open source, offline-first Android gallery built with **Kotlin** and **Jetpack Compose**, with convertation to .webP and .webM
+A lightweight, open source, offline-first Android gallery built with **Kotlin** and **Jetpack Compose**, with conversion to .webP and .webM
 
 ## Features
 
