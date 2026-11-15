@@ -1,6 +1,6 @@
 @file:OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
 
-package com.example.webpgallery
+package org.delwy.webpgallery
 
 import android.Manifest
 import android.app.Activity
@@ -129,7 +129,6 @@ import kotlinx.coroutines.withContext
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Coil умеет доставать кадры из видео для превью
         Coil.setImageLoader(
             ImageLoader.Builder(this)
                 .components { add(VideoFrameDecoder.Factory()) }
@@ -163,7 +162,6 @@ fun GalleryTheme(content: @Composable () -> Unit) {
     )
 }
 
-// ---------------- Щипок: количество фото в ряду ----------------
 
 @Composable
 fun Modifier.pinchColumns(columns: Int, onChange: (Int) -> Unit): Modifier {
@@ -197,7 +195,6 @@ fun Modifier.pinchColumns(columns: Int, onChange: (Int) -> Unit): Modifier {
     }
 }
 
-// ---------------- Главный экран ----------------
 
 @Composable
 fun GalleryApp(vm: GalleryViewModel = viewModel()) {
@@ -247,7 +244,6 @@ fun GalleryApp(vm: GalleryViewModel = viewModel()) {
     val showFab = granted && vm.tab == NavTab.GALLERY && vm.selected.isEmpty() &&
         vm.progress == null && vm.images.any { it.canProcess || it.canTranscode }
 
-    // Пока идёт обработка, экран не гаснет
     val view = LocalView.current
     val busy = vm.progress != null
     DisposableEffect(busy) {
@@ -270,7 +266,6 @@ fun GalleryApp(vm: GalleryViewModel = viewModel()) {
         vm.message?.let { snackbar.showSnackbar(it); vm.message = null }
     }
 
-    // «Назад»: сначала снять выбор, потом выйти из альбома, потом на вкладку «Галерея»
     BackHandler(vm.selected.isNotEmpty()) { vm.clearSelection() }
     BackHandler(vm.selected.isEmpty() && inAlbum) { vm.closeAlbum() }
     BackHandler(vm.selected.isEmpty() && !inAlbum && vm.tab != NavTab.GALLERY) {
@@ -343,7 +338,6 @@ fun GalleryApp(vm: GalleryViewModel = viewModel()) {
                         }
                     }
                 } else {
-                    // Потяните вниз от верха списка — галерея обновится
                     PullToRefreshBox(
                         isRefreshing = vm.refreshing,
                         onRefresh = vm::refresh,
@@ -516,7 +510,6 @@ fun Segmented(options: List<String>, selected: Int, onSelect: (Int) -> Unit) {
     }
 }
 
-// ---------------- Шапка, нижние панели ----------------
 
 @Composable
 fun SortMenu(vm: GalleryViewModel) {
@@ -648,7 +641,6 @@ fun ActionBar(vm: GalleryViewModel, onCompress: () -> Unit) {
 @Composable
 fun EmptyState(icon: ImageVector, text: String) {
     val cs = MaterialTheme.colorScheme
-    // Прокручиваемый, чтобы «потяни для обновления» работало и на пустом экране
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.Center,
@@ -660,7 +652,6 @@ fun EmptyState(icon: ImageVector, text: String) {
     }
 }
 
-// ---------------- Альбомы ----------------
 
 @Composable
 fun AlbumsGrid(vm: GalleryViewModel, state: LazyGridState) {
@@ -722,7 +713,6 @@ fun AlbumCard(album: Album, modifier: Modifier, onClick: () -> Unit) {
     }
 }
 
-// ---------------- Просмотрщик ----------------
 
 @Composable
 fun Viewer(vm: GalleryViewModel, start: Int, origin: Offset, onClose: () -> Unit) {
@@ -741,11 +731,9 @@ fun Viewer(vm: GalleryViewModel, start: Int, origin: Offset, onClose: () -> Unit
     val pager = rememberPagerState(initialPage = start.coerceIn(0, list.lastIndex)) { list.size }
     val cur = list.getOrNull(pager.currentPage)
 
-    // Открытие: фото «вырастает» из плитки
     LaunchedEffect(Unit) {
         progress.animateTo(1f, spring(Spring.DampingRatioLowBouncy, Spring.StiffnessMediumLow))
     }
-    // Новая страница всегда открывается без зума
     LaunchedEffect(pager.currentPage) { zoomed = false }
 
     fun close() {
@@ -840,7 +828,6 @@ fun Viewer(vm: GalleryViewModel, start: Int, origin: Offset, onClose: () -> Unit
                 }
             }
 
-            // Подпись и подсказка — только для фото (у видео внизу своё управление)
             AnimatedVisibility(
                 visible = cur != null && !showInfo && cur.isVideo.not(),
                 modifier = Modifier.align(Alignment.BottomCenter),
@@ -881,9 +868,7 @@ fun Viewer(vm: GalleryViewModel, start: Int, origin: Offset, onClose: () -> Unit
     }
 }
 
-// ---------------- Видео ----------------
 
-/** Страница видео: постер, а плеер поднимается только на активной странице */
 @Composable
 fun VideoPage(img: GalleryImage, active: Boolean, onZoomChange: (Boolean) -> Unit) {
     if (active) {
@@ -953,16 +938,14 @@ private fun ActiveVideo(img: GalleryImage, onZoomChange: (Boolean) -> Unit) {
             delay(250)
         }
     }
-    // Управление прячется само через 3 секунды воспроизведения
     LaunchedEffect(controls, playing) {
         if (controls && playing) {
-            delay(3000)
+            delay(1500)
             controls = false
         }
     }
 
     Box(Modifier.fillMaxSize()) {
-        // Зум действует на видео вместе с постером; тап показывает/прячет управление
         ZoomBox(onZoomChange = onZoomChange, onTap = { controls = !controls }) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 AsyncImage(
@@ -1030,12 +1013,7 @@ private fun ActiveVideo(img: GalleryImage, onZoomChange: (Boolean) -> Unit) {
     }
 }
 
-// ---------------- Зум (фото и видео) ----------------
 
-/**
- * Контейнер с зумом: щипок (до 5×), двойной тап (2.5× и обратно), перемещение пальцем.
- * При масштабе 1× одиночные касания не перехватываются — работают листание и свайпы вверх/вниз.
- */
 @Composable
 fun ZoomBox(
     onZoomChange: (Boolean) -> Unit,
@@ -1117,7 +1095,6 @@ fun ZoomBox(
 @Composable
 fun ZoomableImage(model: Any, onZoomChange: (Boolean) -> Unit) {
     val ctx = LocalContext.current
-    // Запрашиваем картинку с запасом по размеру, чтобы в зуме она не была мыльной
     val request = remember(model) {
         ImageRequest.Builder(ctx).data(model).size(3000, 3000).build()
     }
@@ -1218,7 +1195,6 @@ fun InfoRow(label: String, value: String) {
     }
 }
 
-// ---------------- Сетка ----------------
 
 @Composable
 fun DayHeader(
@@ -1307,7 +1283,6 @@ fun Tile(
             modifier = Modifier.fillMaxSize(),
         )
 
-        // В корзине — срок до автоудаления
         if (daysLeft >= 0 && !dense) {
             Text(
                 text = "$daysLeft дн.",
@@ -1322,7 +1297,6 @@ fun Tile(
             )
         }
 
-        // Видео: значок ▶ и длительность
         if (img.isVideo) {
             if (dense) {
                 Icon(
