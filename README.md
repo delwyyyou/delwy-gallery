@@ -24,7 +24,7 @@ Grab the latest `.apk` from the [Releases](../../releases) page.
 ## Build from Source
 
 ```bash
-git clone https://github.com
+git clone https://github.com/delwyyyou/delwy-gallery.git
 cd delwy-gallery
 ./gradlew assembleDebug
 ```
