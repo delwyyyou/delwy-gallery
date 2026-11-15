@@ -35,4 +35,4 @@ The compiled APK will be located at `app/build/outputs/apk/debug/app-debug.apk`.
 
 🄯 2026 Delwy (`org.delwy.webpgallery`)
 
-This project is free software licensed under the **GNU General Public License v3.0-only** (`GPL-3.0-only`). See the [LICENSE](LICENSE) file for details.
+This project is free software licensed under the **GNU General Public License v3.0** (`GPL-3.0-only`). See the [LICENSE](LICENSE) file for details.
