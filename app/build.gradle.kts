@@ -34,7 +34,6 @@ android {
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
-            // Локально, без ключа, подпишется debug-ключом, чтобы сборка не падала
             signingConfig = if (keystorePath != null)
                 signingConfigs.getByName("release")
             else
