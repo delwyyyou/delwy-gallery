@@ -10,7 +10,6 @@ object ExifReader {
 
     fun read(cr: ContentResolver, uri: Uri): List<Pair<String, String>> {
         return try {
-            // Оригинал нужен, чтобы система не вырезала GPS (требует ACCESS_MEDIA_LOCATION)
             val original = try {
                 cr.openInputStream(MediaStore.setRequireOriginal(uri))
             } catch (e: Exception) {
