@@ -5,18 +5,17 @@ plugins {
 }
 
 android {
-    namespace = "com.example.webpgallery"
+    namespace = "org.delwy.webpgallery"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.example.webpgallery"
+        applicationId = "org.delwy.webpgallery"
         minSdk = 30
         targetSdk = 35
         versionCode = 1
         versionName = "1.0"
     }
 
-    // Ключ приходит из CI через переменные окружения
     val keystorePath: String? = System.getenv("KEYSTORE_PATH")
 
     signingConfigs {
