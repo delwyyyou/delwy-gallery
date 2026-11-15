@@ -15,7 +15,6 @@ A lightweight, open source, offline-first Android gallery built with **Kotlin** 
 
 * **Language:** Kotlin
 * **UI:** Jetpack Compose, Material Design 3
-* **Media Engine:** FFmpegKit (`libwebp`, `libvpx-vp9`, `libopus`)
 * **Storage:** Android MediaStore API (Scoped Storage)
 
 ## Installation
