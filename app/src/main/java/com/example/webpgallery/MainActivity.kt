@@ -100,6 +100,7 @@ import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntSize
@@ -244,7 +245,15 @@ fun GalleryApp(vm: GalleryViewModel = viewModel()) {
 
     val fabExpanded by remember { derivedStateOf { galleryGrid.firstVisibleItemIndex == 0 } }
     val showFab = granted && vm.tab == NavTab.GALLERY && vm.selected.isEmpty() &&
-        vm.progress == null && vm.images.any { it.canProcess }
+        vm.progress == null && vm.images.any { it.canProcess || it.canTranscode }
+
+    // Пока идёт обработка, экран не гаснет
+    val view = LocalView.current
+    val busy = vm.progress != null
+    DisposableEffect(busy) {
+        view.keepScreenOn = busy
+        onDispose { view.keepScreenOn = false }
+    }
 
     LaunchedEffect(Unit) {
         if (permList.any { !has(it) }) permLauncher.launch(permList)
@@ -416,26 +425,62 @@ fun GalleryApp(vm: GalleryViewModel = viewModel()) {
         var quality by remember { mutableFloatStateOf(80f) }
         var lossless by remember { mutableStateOf(false) }
         var trashOrig by remember { mutableStateOf(true) }
-        val all = vm.images.filter { it.canProcess }
+        var includeVideos by remember { mutableStateOf(false) }
+        var vQuality by remember { mutableIntStateOf(1) }
+        var vSide by remember { mutableIntStateOf(0) }
+
+        val allImages = vm.images.filter { it.canProcess }
+        val allVideos = vm.images.filter { it.canTranscode }
+        val selImages = vm.images.count { it.id in vm.selected && it.canProcess }
+        val selVideos = vm.images.count { it.id in vm.selected && it.canTranscode }
+        val photosOn = optimizeAll || selImages > 0
+        val videoCount = if (optimizeAll) allVideos.size else selVideos
+        val videosOn = videoCount > 0 && (!optimizeAll || includeVideos)
+
         AlertDialog(
             onDismissRequest = { showOptions = false },
             title = { Text(if (optimizeAll) "Оптимизировать все" else "Параметры") },
             text = {
-                Column {
+                Column(Modifier.verticalScroll(rememberScrollState())) {
                     if (optimizeAll) {
                         Text(
-                            "Будет обработано: ${all.size} фото (${formatSize(all.sumOf { it.size })})",
+                            "Фото: ${allImages.size} (${formatSize(allImages.sumOf { it.size })})",
                             fontWeight = FontWeight.Bold,
-                            modifier = Modifier.padding(bottom = 12.dp),
+                            modifier = Modifier.padding(bottom = 8.dp),
                         )
                     }
-                    Text("Качество WebP: ${quality.toInt()}")
-                    Slider(value = quality, onValueChange = { quality = it }, valueRange = 50f..100f)
-                    SwitchRow("PNG без потерь (lossless)", lossless) { lossless = it }
+                    if (photosOn) {
+                        Text("Качество WebP: ${quality.toInt()}")
+                        Slider(value = quality, onValueChange = { quality = it }, valueRange = 50f..100f)
+                        SwitchRow("PNG без потерь (lossless)", lossless) { lossless = it }
+                    }
+                    if (optimizeAll && allVideos.isNotEmpty()) {
+                        SwitchRow(
+                            "И видео (${allVideos.size} шт., ${formatSize(allVideos.sumOf { it.size })})",
+                            includeVideos,
+                        ) { includeVideos = it }
+                    }
+                    if (videosOn) {
+                        HorizontalDivider(Modifier.padding(vertical = 10.dp))
+                        Text("Видео → WebM (VP9 + Opus)", fontWeight = FontWeight.Bold)
+                        Spacer(Modifier.height(8.dp))
+                        Text("Качество", style = MaterialTheme.typography.labelLarge)
+                        Segmented(listOf("Мало", "Баланс", "Макс."), vQuality) { vQuality = it }
+                        Spacer(Modifier.height(8.dp))
+                        Text("Разрешение", style = MaterialTheme.typography.labelLarge)
+                        Segmented(listOf("Исходное", "1080p", "720p"), vSide) { vSide = it }
+                        Text(
+                            "Кодирование программное и медленное: минуты на минуту видео, " +
+                                "быстрее при 720p. Не сворачивайте приложение.",
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.padding(top = 8.dp),
+                        )
+                    }
                     SwitchRow("Оригиналы — в корзину", trashOrig) { trashOrig = it }
                     Text(
-                        "Файлы до 300 КБ не пересжимаются — из них только удаляется EXIF. " +
-                            "Уже чистые файлы пропускаются. Дата съёмки сохраняется. Видео не затрагиваются.",
+                        "Фото до 300 КБ не пересжимаются — из них только удаляется EXIF. " +
+                            "Уже чистые файлы и файлы, которые не стали меньше, пропускаются. " +
+                            "Дата съёмки сохраняется.",
                         style = MaterialTheme.typography.bodySmall,
                         modifier = Modifier.padding(top = 8.dp),
                     )
@@ -444,11 +489,30 @@ fun GalleryApp(vm: GalleryViewModel = viewModel()) {
             confirmButton = {
                 TextButton(onClick = {
                     showOptions = false
-                    vm.run(Options(quality.toInt(), lossless, trashOrig), all = optimizeAll)
+                    vm.run(
+                        Options(quality.toInt(), lossless, trashOrig),
+                        VideoOptions(vQuality, listOf(0, 1080, 720)[vSide], includeVideos),
+                        all = optimizeAll,
+                    )
                 }) { Text("Начать") }
             },
             dismissButton = { TextButton(onClick = { showOptions = false }) { Text("Отмена") } },
         )
+    }
+}
+
+@Composable
+fun Segmented(options: List<String>, selected: Int, onSelect: (Int) -> Unit) {
+    SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+        options.forEachIndexed { i, label ->
+            SegmentedButton(
+                selected = selected == i,
+                onClick = { onSelect(i) },
+                shape = SegmentedButtonDefaults.itemShape(i, options.size),
+                icon = {},
+                label = { Text(label, maxLines = 1) },
+            )
+        }
     }
 }
 
@@ -535,10 +599,17 @@ fun ActionBar(vm: GalleryViewModel, onCompress: () -> Unit) {
         Column(Modifier.navigationBarsPadding().padding(horizontal = 20.dp, vertical = 16.dp)) {
             val p = vm.progress
             if (p != null) {
-                Text("Обработка ${p.first + 1} из ${p.second}", fontWeight = FontWeight.Bold)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "Обработка ${p.first + 1} из ${p.second}",
+                        Modifier.weight(1f),
+                        fontWeight = FontWeight.Bold,
+                    )
+                    TextButton(onClick = vm::cancelRun) { Text("Отмена") }
+                }
                 LinearProgressIndicator(
-                    progress = { (p.first + 1f) / p.second },
-                    modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
+                    progress = { ((p.first + vm.subProgress) / p.second).coerceIn(0f, 1f) },
+                    modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
                 )
             } else {
                 val total = vm.current.filter { it.id in vm.selected }.sumOf { it.size }
@@ -745,13 +816,11 @@ fun Viewer(vm: GalleryViewModel, start: Int, origin: Offset, onClose: () -> Unit
                 userScrollEnabled = !zoomed,
             ) { page ->
                 val item = list[page]
+                val onZoom: (Boolean) -> Unit = { if (page == pager.currentPage) zoomed = it }
                 if (item.isVideo) {
-                    VideoPage(item, active = page == pager.currentPage && !closing)
+                    VideoPage(item, active = page == pager.currentPage && !closing, onZoomChange = onZoom)
                 } else {
-                    ZoomableImage(
-                        model = item.uri,
-                        onZoomChange = { if (page == pager.currentPage) zoomed = it },
-                    )
+                    ZoomableImage(model = item.uri, onZoomChange = onZoom)
                 }
             }
 
@@ -814,19 +883,19 @@ fun Viewer(vm: GalleryViewModel, start: Int, origin: Offset, onClose: () -> Unit
 
 // ---------------- Видео ----------------
 
-/** Страница видео: постер всегда, а плеер поднимается только на активной странице */
+/** Страница видео: постер, а плеер поднимается только на активной странице */
 @Composable
-fun VideoPage(img: GalleryImage, active: Boolean) {
-    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        AsyncImage(
-            model = img.uri,
-            contentDescription = null,
-            contentScale = ContentScale.Fit,
-            modifier = Modifier.fillMaxSize(),
-        )
-        if (active) {
-            ActiveVideo(img)
-        } else {
+fun VideoPage(img: GalleryImage, active: Boolean, onZoomChange: (Boolean) -> Unit) {
+    if (active) {
+        ActiveVideo(img, onZoomChange)
+    } else {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            AsyncImage(
+                model = img.uri,
+                contentDescription = null,
+                contentScale = ContentScale.Fit,
+                modifier = Modifier.fillMaxSize(),
+            )
             Box(
                 Modifier.size(64.dp).clip(CircleShape).background(Color.Black.copy(alpha = 0.5f)),
                 contentAlignment = Alignment.Center,
@@ -838,7 +907,7 @@ fun VideoPage(img: GalleryImage, active: Boolean) {
 }
 
 @Composable
-private fun ActiveVideo(img: GalleryImage) {
+private fun ActiveVideo(img: GalleryImage, onZoomChange: (Boolean) -> Unit) {
     val ctx = LocalContext.current
     val player = remember(img.uri) {
         ExoPlayer.Builder(ctx)
@@ -892,17 +961,23 @@ private fun ActiveVideo(img: GalleryImage) {
         }
     }
 
-    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        AndroidView(
-            factory = { c -> TextureView(c).also { player.setVideoTextureView(it) } },
-            modifier = Modifier.aspectRatio(ratio),
-        )
-        // Тап по видео показывает/прячет управление
-        Box(
-            Modifier
-                .fillMaxSize()
-                .pointerInput(Unit) { detectTapGestures(onTap = { controls = !controls }) }
-        )
+    Box(Modifier.fillMaxSize()) {
+        // Зум действует на видео вместе с постером; тап показывает/прячет управление
+        ZoomBox(onZoomChange = onZoomChange, onTap = { controls = !controls }) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                AsyncImage(
+                    model = img.uri,
+                    contentDescription = null,
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier.fillMaxSize(),
+                )
+                AndroidView(
+                    factory = { c -> TextureView(c).also { player.setVideoTextureView(it) } },
+                    modifier = Modifier.aspectRatio(ratio),
+                )
+            }
+        }
+
         AnimatedVisibility(
             visible = controls,
             modifier = Modifier.align(Alignment.BottomCenter),
@@ -955,14 +1030,20 @@ private fun ActiveVideo(img: GalleryImage) {
     }
 }
 
+// ---------------- Зум (фото и видео) ----------------
+
 /**
- * Зум щипком (до 5×), двойной тап (2.5× и обратно), перемещение пальцем в приближении.
+ * Контейнер с зумом: щипок (до 5×), двойной тап (2.5× и обратно), перемещение пальцем.
  * При масштабе 1× одиночные касания не перехватываются — работают листание и свайпы вверх/вниз.
  */
 @Composable
-fun ZoomableImage(model: Any, onZoomChange: (Boolean) -> Unit) {
-    val ctx = LocalContext.current
+fun ZoomBox(
+    onZoomChange: (Boolean) -> Unit,
+    onTap: (() -> Unit)? = null,
+    content: @Composable BoxScope.() -> Unit,
+) {
     val scope = rememberCoroutineScope()
+    val tapCb by rememberUpdatedState(onTap)
     var scale by remember { mutableFloatStateOf(1f) }
     var offset by remember { mutableStateOf(Offset.Zero) }
     var viewSize by remember { mutableStateOf(IntSize.Zero) }
@@ -981,20 +1062,23 @@ fun ZoomableImage(model: Any, onZoomChange: (Boolean) -> Unit) {
             .fillMaxSize()
             .onSizeChanged { viewSize = it }
             .pointerInput(Unit) {
-                detectTapGestures(onDoubleTap = { tap ->
-                    scope.launch {
-                        val startScale = scale
-                        val startOffset = offset
-                        val target = if (startScale > 1.05f) 1f else 2.5f
-                        val focus = tap - Offset(viewSize.width / 2f, viewSize.height / 2f)
-                        animate(0f, 1f, animationSpec = tween(280)) { t, _ ->
-                            val s = lerp(startScale, target, t).coerceIn(1f, 5f)
-                            val z = s / startScale
-                            scale = s
-                            offset = clamp(focus * (1f - z) + startOffset * z, s)
+                detectTapGestures(
+                    onTap = { tapCb?.invoke() },
+                    onDoubleTap = { tap ->
+                        scope.launch {
+                            val startScale = scale
+                            val startOffset = offset
+                            val target = if (startScale > 1.05f) 1f else 2.5f
+                            val focus = tap - Offset(viewSize.width / 2f, viewSize.height / 2f)
+                            animate(0f, 1f, animationSpec = tween(280)) { t, _ ->
+                                val s = lerp(startScale, target, t).coerceIn(1f, 5f)
+                                val z = s / startScale
+                                scale = s
+                                offset = clamp(focus * (1f - z) + startOffset * z, s)
+                            }
                         }
-                    }
-                })
+                    },
+                )
             }
             .pointerInput(Unit) {
                 awaitEachGesture {
@@ -1025,23 +1109,25 @@ fun ZoomableImage(model: Any, onZoomChange: (Boolean) -> Unit) {
                 scaleY = scale
                 translationX = offset.x
                 translationY = offset.y
-            }
-    ) {
-        if (viewSize.width > 0) {
-            // Запрашиваем картинку с запасом по размеру, чтобы в зуме она не была мыльной
-            val request = remember(model, viewSize) {
-                ImageRequest.Builder(ctx)
-                    .data(model)
-                    .size(viewSize.width * 3, viewSize.height * 3)
-                    .build()
-            }
-            AsyncImage(
-                model = request,
-                contentDescription = null,
-                contentScale = ContentScale.Fit,
-                modifier = Modifier.fillMaxSize(),
-            )
-        }
+            },
+        content = content,
+    )
+}
+
+@Composable
+fun ZoomableImage(model: Any, onZoomChange: (Boolean) -> Unit) {
+    val ctx = LocalContext.current
+    // Запрашиваем картинку с запасом по размеру, чтобы в зуме она не была мыльной
+    val request = remember(model) {
+        ImageRequest.Builder(ctx).data(model).size(3000, 3000).build()
+    }
+    ZoomBox(onZoomChange = onZoomChange) {
+        AsyncImage(
+            model = request,
+            contentDescription = null,
+            contentScale = ContentScale.Fit,
+            modifier = Modifier.fillMaxSize(),
+        )
     }
 }
 
