@@ -35,7 +35,6 @@ object ImageProcessor {
         var ext = origExt
         var outMime = img.mime
 
-        // Больше 300 КБ — конвертируем в WebP (EXIF при перекодировании исчезает сам)
         if (bytes.size > SIZE_LIMIT) {
             val webp = toWebp(cr, img.uri, isPng, opt)
             if (webp.size < bytes.size) {
@@ -44,12 +43,10 @@ object ImageProcessor {
                 outMime = "image/webp"
             }
         }
-        // Маленькие файлы (или если WebP вышел не меньше) — без пересжатия, только чистим метаданные
         if (data == null) {
             data = stripMetadata(cr, img.uri, img.mime, bytes)
         }
 
-        // Нечего чистить и сжимать — ничего не создаём и оригинал не трогаем
         if (outMime == img.mime && data.size == bytes.size) {
             return Result(bytes.size.toLong(), bytes.size.toLong(), skipped = true)
         }
@@ -57,7 +54,7 @@ object ImageProcessor {
         val dir = if (img.relativePath.startsWith("DCIM") || img.relativePath.startsWith("Pictures"))
             img.relativePath else "Pictures/WebP Gallery"
 
-        val taken = img.date // дата съёмки (или время изменения, если съёмки нет)
+        val taken = img.date
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, "$base.$ext")
             put(MediaStore.Images.Media.MIME_TYPE, outMime)
@@ -73,7 +70,6 @@ object ImageProcessor {
             cr.update(newUri, ContentValues().apply {
                 put(MediaStore.Images.Media.IS_PENDING, 0)
             }, null, null)
-            // Сканер мог перезаписать даты при снятии IS_PENDING — возвращаем оригинальные
             restoreDates(cr, newUri, taken, img.dateModified)
         } catch (e: Throwable) {
             cr.delete(newUri, null, null)
@@ -82,7 +78,6 @@ object ImageProcessor {
         return Result(bytes.size.toLong(), data.size.toLong())
     }
 
-    /** Очистка метаданных прямо в файле (нужен createWriteRequest). Всё считается в памяти до записи. */
     fun cleanInPlace(cr: ContentResolver, img: GalleryImage) {
         val bytes = cr.openInputStream(img.uri)!!.use { it.readBytes() }
         val clean = stripMetadata(cr, img.uri, img.mime, bytes)
@@ -91,7 +86,6 @@ object ImageProcessor {
         restoreDates(cr, img.uri, img.date, img.dateModified)
     }
 
-    // ---------- Даты ----------
 
     fun restoreDates(cr: ContentResolver, uri: Uri, takenMs: Long, modifiedSec: Long) {
         try {
@@ -117,7 +111,6 @@ object ImageProcessor {
         }
     }
 
-    // ---------- Метаданные ----------
 
     fun stripMetadata(cr: ContentResolver, uri: Uri, mime: String, bytes: ByteArray): ByteArray =
         when (mime) {
@@ -126,7 +119,6 @@ object ImageProcessor {
             else -> stripJpeg(cr, uri, bytes)
         }
 
-    // ---------- WebP ----------
 
     private fun toWebp(cr: ContentResolver, uri: Uri, isPng: Boolean, opt: Options): ByteArray {
         val bmp = decode(cr, uri)
@@ -140,13 +132,11 @@ object ImageProcessor {
         }
     }
 
-    // ImageDecoder сам применяет EXIF-поворот, поэтому картинка не «ляжет на бок»
     private fun decode(cr: ContentResolver, uri: Uri): Bitmap =
         ImageDecoder.decodeBitmap(ImageDecoder.createSource(cr, uri)) { dec, _, _ ->
             dec.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
         }
 
-    // Удаляем чанки EXIF и XMP из RIFF-контейнера и сбрасываем флаги в VP8X
     private fun stripWebp(src: ByteArray): ByteArray {
         if (src.size < 12 ||
             String(src, 0, 4, Charsets.ISO_8859_1) != "RIFF" ||
@@ -180,7 +170,6 @@ object ImageProcessor {
         return res
     }
 
-    // ---------- JPEG: удаляем метаданные без перекодирования ----------
 
     private fun stripJpeg(cr: ContentResolver, uri: Uri, src: ByteArray): ByteArray {
         val orientation = ExifInterface(ByteArrayInputStream(src))
@@ -188,7 +177,6 @@ object ImageProcessor {
         if (orientation != ExifInterface.ORIENTATION_NORMAL &&
             orientation != ExifInterface.ORIENTATION_UNDEFINED
         ) {
-            // Тег поворота исчезнет вместе с EXIF, поэтому физически поворачиваем пиксели
             val bmp = decode(cr, uri)
             try {
                 return ByteArrayOutputStream()
@@ -210,19 +198,17 @@ object ImageProcessor {
             if (src[i] != 0xFF.toByte()) break
             val marker = src[i + 1].toInt() and 0xFF
             if (marker == 0xFF) { i++; continue }
-            if (marker == 0xDA) break // SOS — дальше данные изображения
+            if (marker == 0xDA) break
             val len = ((src[i + 2].toInt() and 0xFF) shl 8) or (src[i + 3].toInt() and 0xFF)
             val end = i + 2 + len
             if (end > src.size) break
             val isMpf = marker == 0xE2 && end - i >= 8 &&
                 src[i + 4] == 'M'.code.toByte() && src[i + 5] == 'P'.code.toByte() &&
                 src[i + 6] == 'F'.code.toByte()
-            // APP1 (EXIF/XMP), APP13 (Photoshop/IPTC), COM, MPF — удаляем; ICC (APP2) и JFIF оставляем
             val drop = marker == 0xE1 || marker == 0xED || marker == 0xFE || isMpf
             if (!drop) out.write(src, i, end - i)
             i = end
         }
-        // Копируем данные до первого EOI, всё что после (видео motion photo и т.п.) отбрасываем
         var j = i
         while (j + 1 < src.size && !(src[j] == 0xFF.toByte() && src[j + 1] == 0xD9.toByte())) j++
         val tail = if (j + 1 < src.size) j + 2 else src.size
@@ -230,7 +216,6 @@ object ImageProcessor {
         return out.toByteArray()
     }
 
-    // ---------- PNG: выкидываем текстовые чанки и eXIf ----------
 
     private val pngDrop = setOf("eXIf", "tEXt", "zTXt", "iTXt", "tIME")
 
