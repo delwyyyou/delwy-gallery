@@ -5,12 +5,10 @@
     android:viewportWidth="108"
     android:viewportHeight="108">
 
-    <!-- Солнце -->
     <path
         android:fillColor="#FFC857"
         android:pathData="M63,40a7,7 0,1 0,14 0a7,7 0,1 0,-14 0z" />
 
-    <!-- Задняя гора -->
     <path
         android:fillColor="#8EA4D2"
         android:pathData="M49,73L65,52L81,73Z"
@@ -21,7 +19,6 @@
         android:fillColor="#7189BE"
         android:pathData="M65,52L81,73L72,73Z" />
 
-    <!-- Передняя гора -->
     <path
         android:fillColor="#E9EEF9"
         android:pathData="M27,73L45,45L63,73Z"
