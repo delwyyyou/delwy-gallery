@@ -8,6 +8,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.provider.MediaStore
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -39,6 +40,7 @@ data class GalleryImage(
 ) {
     val isVideo get() = mime.startsWith("video/")
     val canProcess get() = mime == "image/jpeg" || mime == "image/png"
+    val canTranscode get() = isVideo && mime != "video/webm"
     val isBig get() = canProcess && size > SIZE_LIMIT
 
     /** Дата для сортировки: съёмка, а если её нет — время изменения (мс) */
@@ -120,6 +122,7 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
     var album by mutableStateOf<String?>(null); private set
     var selected by mutableStateOf<Set<Long>>(emptySet()); private set
     var progress by mutableStateOf<Pair<Int, Int>?>(null); private set
+    var subProgress by mutableFloatStateOf(0f); private set
     var sort by mutableStateOf(SortMode.DATE_DESC); private set
     var refreshing by mutableStateOf(false); private set
     var exifVersion by mutableIntStateOf(0); private set
@@ -136,6 +139,9 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
     private var rawImages = emptyList<GalleryImage>()
     private var rawTrash = emptyList<GalleryImage>()
     private var pendingClean: GalleryImage? = null
+
+    @Volatile
+    private var cancelFlag = false
 
     // Системные запросы идут пачками, чтобы не упереться в лимит размера PendingIntent
     private val queue = ArrayDeque<Pair<Op, List<Uri>>>()
@@ -317,28 +323,54 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    // ---------- Сжатие ----------
+    // ---------- Сжатие фото и видео ----------
 
-    /** all = true — обработать все JPEG/PNG в галерее, иначе только выбранные */
-    fun run(opt: Options, all: Boolean = false) {
+    fun cancelRun() {
+        cancelFlag = true
+    }
+
+    /**
+     * all = true — все JPEG/PNG в галерее (и видео, если vopt.include),
+     * иначе только выбранные фото и видео.
+     */
+    fun run(opt: Options, vopt: VideoOptions, all: Boolean = false) {
         if (progress != null) return
-        val list = if (all) images.filter { it.canProcess }
-        else images.filter { it.id in selected && it.canProcess }
+        val imgs = images.filter { it.canProcess && (all || it.id in selected) }
+        var vids = images.filter { it.canTranscode && (if (all) vopt.include else it.id in selected) }
+        var note: String? = null
+        if (vids.isNotEmpty() && !VideoTranscoder.isSupported()) {
+            vids = emptyList()
+            note = "нет VP9-кодера, видео пропущены"
+        }
+        val list = imgs + vids
         if (list.isEmpty()) {
-            message = "Нет JPEG/PNG для обработки"
+            message = note?.let { "Нечего обрабатывать: $it" } ?: "Нет файлов для обработки"
             return
         }
+        cancelFlag = false
         progress = 0 to list.size
+        subProgress = 0f
+        val app = getApplication<Application>()
         viewModelScope.launch {
             var saved = 0L
             var ok = 0
             var skipped = 0
             var fail = 0
+            var canceled = false
+            var firstError: String? = null
             val processed = mutableListOf<Uri>()
-            list.forEachIndexed { idx, img ->
+            for ((idx, img) in list.withIndex()) {
+                if (cancelFlag) { canceled = true; break }
                 progress = idx to list.size
+                subProgress = 0f
                 try {
-                    val r = withContext(Dispatchers.IO) { ImageProcessor.process(cr, img, opt) }
+                    val r = withContext(Dispatchers.IO) {
+                        if (img.isVideo) {
+                            VideoTranscoder.process(app, img, vopt, { subProgress = it }, { cancelFlag })
+                        } else {
+                            ImageProcessor.process(cr, img, opt)
+                        }
+                    }
                     if (r.skipped) {
                         skipped++
                     } else {
@@ -346,16 +378,22 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
                         ok++
                         processed += img.uri
                     }
+                } catch (e: TranscodeCanceled) {
+                    canceled = true
+                    break
                 } catch (e: Throwable) {
                     fail++
+                    if (firstError == null) firstError = e.message ?: e.javaClass.simpleName
                 }
             }
             progress = null
+            subProgress = 0f
             selected = emptySet()
             message = buildString {
-                append("Готово: $ok")
+                append(if (canceled) "Отменено. Готово: $ok" else "Готово: $ok")
                 if (skipped > 0) append(", пропущено: $skipped")
-                if (fail > 0) append(", ошибок: $fail")
+                if (fail > 0) append(", ошибок: $fail (${firstError ?: "?"})")
+                if (note != null) append(", $note")
                 append(". Освобождено ${formatSize(saved)}")
             }
             load()
