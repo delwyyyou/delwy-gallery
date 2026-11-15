@@ -25,25 +25,23 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 
-/** Фото или видео */
 data class GalleryImage(
     val id: Long,
     val uri: Uri,
     val name: String,
     val mime: String,
     val size: Long,
-    val dateTaken: Long,    // мс, может быть 0
-    val dateModified: Long, // секунды
+    val dateTaken: Long,
+    val dateModified: Long,
     val relativePath: String,
-    val expires: Long,      // секунды; для элементов в корзине — когда удалятся сами
-    val duration: Long,     // мс, только для видео
+    val expires: Long,
+    val duration: Long,
 ) {
     val isVideo get() = mime.startsWith("video/")
     val canProcess get() = mime == "image/jpeg" || mime == "image/png"
     val canTranscode get() = isVideo && mime != "video/webm"
     val isBig get() = canProcess && size > SIZE_LIMIT
 
-    /** Дата для сортировки: съёмка, а если её нет — время изменения (мс) */
     val date: Long get() = if (dateTaken > 0) dateTaken else dateModified * 1000
 }
 
@@ -109,12 +107,10 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
 
     private enum class Op { TRASH, RESTORE, DELETE }
 
-    /** Все фото и видео (имя осталось с прежних времён) */
     var images by mutableStateOf<List<GalleryImage>>(emptyList()); private set
     var trash by mutableStateOf<List<GalleryImage>>(emptyList()); private set
     var albums by mutableStateOf<List<Album>>(emptyList()); private set
 
-    /** То, что сейчас показано в сетке: галерея, открытый альбом или корзина */
     var current by mutableStateOf<List<GalleryImage>>(emptyList()); private set
     var entries by mutableStateOf<List<Entry>>(emptyList()); private set
 
@@ -130,10 +126,8 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
 
     val showTrash: Boolean get() = tab == NavTab.TRASH
 
-    /** Корзина / восстановление / удаление навсегда — после результата вызываем onSystemResult */
     val request = MutableSharedFlow<IntentSender>(extraBufferCapacity = 1)
 
-    /** Запрос на запись в файл (очистка EXIF) */
     val cleanRequest = MutableSharedFlow<IntentSender>(extraBufferCapacity = 1)
 
     private var rawImages = emptyList<GalleryImage>()
@@ -143,13 +137,11 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
     @Volatile
     private var cancelFlag = false
 
-    // Системные запросы идут пачками, чтобы не упереться в лимит размера PendingIntent
     private val queue = ArrayDeque<Pair<Op, List<Uri>>>()
     private var inFlight = false
 
     private val cr: ContentResolver get() = getApplication<Application>().contentResolver
 
-    // ---------- Загрузка, обновление и сортировка ----------
 
     private suspend fun reload() {
         val (a, t) = withContext(Dispatchers.IO) { query(false) to query(true) }
@@ -164,14 +156,13 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch { reload() }
     }
 
-    /** «Потяни для обновления» */
     fun refresh() {
         if (refreshing) return
         viewModelScope.launch {
             refreshing = true
             try {
                 reload()
-                delay(400) // чтобы индикатор не мигал слишком быстро
+                delay(450) 
             } finally {
                 refreshing = false
             }
@@ -193,7 +184,6 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
         images = sorted(rawImages)
         trash = sorted(rawTrash)
         albums = buildAlbums(rawImages)
-        // если открытый альбом опустел — возвращаемся к списку альбомов
         if (album != null && albums.none { it.path == album }) album = null
         rebuildEntries()
     }
@@ -208,7 +198,6 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
         entries = buildEntries(current, sort != SortMode.SIZE_DESC)
     }
 
-    // ---------- Вкладки и альбомы ----------
 
     fun openTab(t: NavTab) {
         tab = t
@@ -229,7 +218,6 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
         rebuildEntries()
     }
 
-    // ---------- Выбор ----------
 
     fun toggle(id: Long) {
         selected = if (id in selected) selected - id else selected + id
@@ -245,7 +233,6 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun selectedUris(): List<Uri> = current.filter { it.id in selected }.map { it.uri }
 
-    // ---------- Корзина (системные запросы пачками) ----------
 
     private fun enqueue(op: Op, uris: List<Uri>) {
         if (uris.isEmpty()) return
@@ -271,7 +258,6 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Вызывается после ответа пользователя на системный диалог */
     fun onSystemResult(ok: Boolean) {
         inFlight = false
         if (ok) {
@@ -283,7 +269,6 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
         load()
     }
 
-    /** true — в корзину, false — восстановить */
     fun moveSelected(toTrash: Boolean) {
         enqueue(if (toTrash) Op.TRASH else Op.RESTORE, selectedUris())
     }
@@ -292,7 +277,6 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
         enqueue(Op.DELETE, selectedUris())
     }
 
-    // ---------- Очистка EXIF прямо в файле ----------
 
     fun requestClean(img: GalleryImage) {
         pendingClean = img
@@ -314,7 +298,6 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
             }
             exifVersion++
             load()
-            // сканер MediaStore мог пересчитать дату уже после записи — возвращаем её ещё раз
             delay(1200)
             withContext(Dispatchers.IO) {
                 ImageProcessor.restoreDates(cr, img.uri, img.date, img.dateModified)
@@ -323,16 +306,11 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    // ---------- Сжатие фото и видео ----------
 
     fun cancelRun() {
         cancelFlag = true
     }
 
-    /**
-     * all = true — все JPEG/PNG в галерее (и видео, если vopt.include),
-     * иначе только выбранные фото и видео.
-     */
     fun run(opt: Options, vopt: VideoOptions, all: Boolean = false) {
         if (progress != null) return
         val imgs = images.filter { it.canProcess && (all || it.id in selected) }
@@ -401,7 +379,6 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    // ---------- MediaStore ----------
 
     private fun query(trashed: Boolean): List<GalleryImage> {
         val coll = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL)
