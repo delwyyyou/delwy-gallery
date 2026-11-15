@@ -1,4 +1,4 @@
-package com.example.webpgallery
+package org.delwy.webpgallery
 
 import android.content.ContentResolver
 import android.content.ContentValues
@@ -20,9 +20,9 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 data class VideoOptions(
-    val quality: Int = 1,          // 0 — мало, 1 — баланс, 2 — максимум
-    val maxSide: Int = 0,          // 0 — исходное разрешение
-    val include: Boolean = false,  // для «Оптимизировать все»: обрабатывать ли видео
+    val quality: Int = 1,
+    val maxSide: Int = 0,
+    val include: Boolean = false,
 )
 
 class TranscodeCanceled : Exception("Отменено")
@@ -34,7 +34,6 @@ object VideoTranscoder {
     private class Sample(val data: ByteArray, val ptsUs: Long, val flags: Int)
     private class AudioResult(val format: MediaFormat, val samples: List<Sample>)
 
-    // ---------- Проверка, есть ли в телефоне VP9-кодер ----------
 
     private fun vp9Format(w: Int, h: Int, bitrate: Int, fps: Int): MediaFormat =
         MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_VP9, w, h).apply {
@@ -57,7 +56,6 @@ object VideoTranscoder {
 
     fun isSupported(): Boolean = findVp9Encoder(1280, 720, 2_000_000, 30) != null
 
-    // ---------- Основная точка входа ----------
 
     fun process(
         ctx: Context,
@@ -89,7 +87,6 @@ object VideoTranscoder {
             }
             val outSize = cr.openFileDescriptor(newUri, "r")!!.use { it.statSize }
             if (outSize <= 0 || outSize >= img.size) {
-                // WebM не получился меньше — оригинал оставляем как есть
                 cr.delete(newUri, null, null)
                 return Result(img.size, img.size, skipped = true)
             }
@@ -122,7 +119,6 @@ object VideoTranscoder {
         onProgress: (Float) -> Unit,
         canceled: () -> Boolean,
     ) {
-        // Сначала звук целиком (он быстрый), потом видео
         val audio = transcodeAudio(ctx, uri, canceled)
         val muxer = MediaMuxer(fd, MediaMuxer.OutputFormat.MUXER_OUTPUT_WEBM)
         try {
@@ -143,7 +139,6 @@ object VideoTranscoder {
         return ex
     }
 
-    // ---------- Видео: декодер → поворот/масштаб на CPU → VP9-кодер ----------
 
     private fun transcodeVideo(
         ctx: Context,
@@ -173,7 +168,6 @@ object VideoTranscoder {
                 inFmt.getLong(MediaFormat.KEY_DURATION) else 0L
             val fps = (inFmt.getNumber(MediaFormat.KEY_FRAME_RATE)?.toInt() ?: 30).coerceIn(10, 60)
 
-            // WebM не хранит поворот, поэтому поворачиваем сами пиксели
             val swap = rotation == 90 || rotation == 270
             var outW = if (swap) srcH else srcW
             var outH = if (swap) srcW else srcH
@@ -222,7 +216,6 @@ object VideoTranscoder {
                     if (canceled()) throw TranscodeCanceled()
                     var progressed = false
 
-                    // 1. Подаём сжатые данные в декодер
                     if (!exDone) {
                         val i = dec.dequeueInputBuffer(0)
                         if (i >= 0) {
@@ -239,7 +232,6 @@ object VideoTranscoder {
                         }
                     }
 
-                    // 2. Кадр из декодера → конвертация → вход кодера
                     if (!encInEos) {
                         if (encIn < 0) encIn = enc.dequeueInputBuffer(0)
                         if (encIn >= 0) {
@@ -279,7 +271,6 @@ object VideoTranscoder {
                         }
                     }
 
-                    // 3. Забираем готовые VP9-пакеты и пишем в WebM
                     val eo = enc.dequeueOutputBuffer(eInfo, 0)
                     when {
                         eo == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
@@ -319,7 +310,6 @@ object VideoTranscoder {
         }
     }
 
-    // ---------- Запись в WebM: звук подмешивается по времени ----------
 
     private class WebmSink(private val muxer: MediaMuxer, private val audio: AudioResult?) {
         var started = false
@@ -353,7 +343,6 @@ object VideoTranscoder {
         }
     }
 
-    // ---------- Конвертация кадра: поворот + масштаб в I420 ----------
 
     private class PlaneMap(
         private val srcW: Int,
@@ -493,7 +482,6 @@ object VideoTranscoder {
         }
     }
 
-    // ---------- Звук: любой формат → PCM → Opus ----------
 
     private class ShortQueue {
         private val chunks = ArrayDeque<ShortArray>()
@@ -527,7 +515,6 @@ object VideoTranscoder {
         }
     }
 
-    /** Потоковый линейный ресемплер (нужен, если частота не поддерживается Opus, например 44100 Гц) */
     private class Resampler(inRate: Int, outRate: Int, private val ch: Int) {
         private val step = inRate.toDouble() / outRate
         private var pos = 0.0
@@ -588,7 +575,6 @@ object VideoTranscoder {
             var firstPts = -1L
             var fedFrames = 0L
 
-            // Кодер создаём, когда декодер сообщил реальную частоту и число каналов
             fun setup(f: MediaFormat) {
                 val inRate = f.getInteger(MediaFormat.KEY_SAMPLE_RATE)
                 channels = f.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
@@ -613,7 +599,6 @@ object VideoTranscoder {
                 if (decDone && enc == null) return null // звуковых кадров не оказалось
                 var progressed = false
 
-                // 1. Данные в декодер
                 if (!exDone) {
                     val i = dec.dequeueInputBuffer(0)
                     if (i >= 0) {
@@ -630,7 +615,6 @@ object VideoTranscoder {
                     }
                 }
 
-                // 2. PCM из декодера (пока очередь не раздулась)
                 if (!decDone && pcm.size < 200_000) {
                     val o = dec.dequeueOutputBuffer(info, 0)
                     if (o == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
@@ -663,7 +647,6 @@ object VideoTranscoder {
                     }
                 }
 
-                // 3. PCM в Opus-кодер
                 val e = enc
                 if (e != null && !encEos) {
                     val avail = pcm.size / channels * channels
@@ -691,7 +674,6 @@ object VideoTranscoder {
                     }
                 }
 
-                // 4. Готовый Opus
                 if (e != null) {
                     val o = e.dequeueOutputBuffer(info, 0)
                     when {
