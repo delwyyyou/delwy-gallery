@@ -1,4 +1,4 @@
-package com.example.webpgallery
+package org.delwy.webpgallery
 
 import android.content.ContentResolver
 import android.net.Uri
