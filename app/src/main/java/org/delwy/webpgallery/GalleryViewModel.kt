@@ -14,6 +14,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -133,6 +134,7 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
     private var rawImages = emptyList<GalleryImage>()
     private var rawTrash = emptyList<GalleryImage>()
     private var pendingClean: GalleryImage? = null
+    private var writeWaiter: CompletableDeferred<Boolean>? = null
 
     @Volatile
     private var cancelFlag = false
@@ -162,7 +164,7 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
             refreshing = true
             try {
                 reload()
-                delay(450) 
+                delay(400)
             } finally {
                 refreshing = false
             }
@@ -197,7 +199,7 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
         }
         entries = buildEntries(current, sort != SortMode.SIZE_DESC)
     }
-
+ 
 
     fun openTab(t: NavTab) {
         tab = t
@@ -232,7 +234,6 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
     fun selectAll() { selected = current.map { it.id }.toSet() }
 
     private fun selectedUris(): List<Uri> = current.filter { it.id in selected }.map { it.uri }
-
 
     private fun enqueue(op: Op, uris: List<Uri>) {
         if (uris.isEmpty()) return
@@ -277,6 +278,12 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
         enqueue(Op.DELETE, selectedUris())
     }
 
+    private suspend fun requestWrite(uris: List<Uri>): Boolean {
+        val waiter = CompletableDeferred<Boolean>()
+        writeWaiter = waiter
+        cleanRequest.emit(MediaStore.createWriteRequest(cr, uris).intentSender)
+        return waiter.await()
+    }
 
     fun requestClean(img: GalleryImage) {
         pendingClean = img
@@ -286,6 +293,13 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun onCleanResult(ok: Boolean) {
+        // Если это ответ на запрос «замены на месте» из run() — просто передаём его туда
+        val waiter = writeWaiter
+        if (waiter != null) {
+            writeWaiter = null
+            waiter.complete(ok)
+            return
+        }
         val img = pendingClean ?: return
         pendingClean = null
         if (!ok) return
@@ -298,6 +312,7 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
             }
             exifVersion++
             load()
+            // сканер MediaStore мог пересчитать дату уже после записи — возвращаем её ещё раз
             delay(1200)
             withContext(Dispatchers.IO) {
                 ImageProcessor.restoreDates(cr, img.uri, img.date, img.dateModified)
@@ -306,11 +321,16 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    // ---------- Сжатие фото и видео ----------
 
     fun cancelRun() {
         cancelFlag = true
     }
 
+    /**
+     * all = true — все JPEG/PNG в галерее (и видео, если vopt.include),
+     * иначе только выбранные фото и видео.
+     */
     fun run(opt: Options, vopt: VideoOptions, all: Boolean = false) {
         if (progress != null) return
         val imgs = images.filter { it.canProcess && (all || it.id in selected) }
@@ -333,20 +353,37 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
             var saved = 0L
             var ok = 0
             var skipped = 0
+            var noAccess = 0
             var fail = 0
             var canceled = false
             var firstError: String? = null
             val processed = mutableListOf<Uri>()
+
+            // Фото вне DCIM/Pictures заменяем на месте (рядом с оригиналом новый файл не создать).
+            // Только если оригиналы всё равно должны уйти; иначе — копия в Pictures/WebP Gallery.
+            val inPlace = if (opt.trashOriginals) imgs.filter { needsInPlace(it) } else emptyList()
+            val inPlaceIds = inPlace.map { it.id }.toSet()
+            val granted = mutableSetOf<Long>()
+            for (chunk in inPlace.chunked(500)) {
+                if (!requestWrite(chunk.map { it.uri })) break
+                granted += chunk.map { it.id }
+            }
+
             for ((idx, img) in list.withIndex()) {
                 if (cancelFlag) { canceled = true; break }
                 progress = idx to list.size
                 subProgress = 0f
+                if (img.id in inPlaceIds && img.id !in granted) {
+                    noAccess++
+                    continue
+                }
                 try {
                     val r = withContext(Dispatchers.IO) {
-                        if (img.isVideo) {
-                            VideoTranscoder.process(app, img, vopt, { subProgress = it }, { cancelFlag })
-                        } else {
-                            ImageProcessor.process(cr, img, opt)
+                        when {
+                            img.isVideo ->
+                                VideoTranscoder.process(app, img, vopt, { subProgress = it }, { cancelFlag })
+                            img.id in inPlaceIds -> ImageProcessor.processInPlace(cr, img, opt)
+                            else -> ImageProcessor.process(cr, img, opt)
                         }
                     }
                     if (r.skipped) {
@@ -354,7 +391,8 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
                     } else {
                         saved += r.before - r.after
                         ok++
-                        processed += img.uri
+                        // замена на месте: сам файл уже и есть результат, в корзину его не нужно
+                        if (img.id !in inPlaceIds) processed += img.uri
                     }
                 } catch (e: TranscodeCanceled) {
                     canceled = true
@@ -370,6 +408,7 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
             message = buildString {
                 append(if (canceled) "Отменено. Готово: $ok" else "Готово: $ok")
                 if (skipped > 0) append(", пропущено: $skipped")
+                if (noAccess > 0) append(", нет доступа: $noAccess")
                 if (fail > 0) append(", ошибок: $fail (${firstError ?: "?"})")
                 if (note != null) append(", $note")
                 append(". Освобождено ${formatSize(saved)}")
@@ -379,6 +418,7 @@ class GalleryViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    // ---------- MediaStore ----------
 
     private fun query(trashed: Boolean): List<GalleryImage> {
         val coll = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL)
